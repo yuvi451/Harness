@@ -19,20 +19,28 @@ Release scanning found absolute developer paths in older compiled binaries, desp
 | Check | Result |
 | --- | --- |
 | Complete normal native suite | **283 tests, zero failures, 3 optional-reference skips**, 77.634s |
+| Independent extracted-source native suite | 283 tests, zero failures, 3 optional-reference skips, 78.255s; licensed font supplied locally as documented |
 | Pane regressions after color-only seam correction | 18 tests, zero failures, 2 optional-reference skips, 27.321s |
 | Integrated prompt/settings/provider regressions | 63 tests, zero failures, 3.830s |
 | Address Sanitizer, changed pane/prompt/provider paths | 81 tests, zero failures, 2 optional-reference skips, 80.168s; no sanitizer findings |
+| Thread Sanitizer, changed pane/prompt/provider paths | 81 tests, zero failures, 2 optional-reference skips, 124.099s; no sanitizer findings |
 | Native prompt-editor layout and rendered preview | Pass; usable wrapped document width, multiline save/reset/draft/busy assertions |
 | Packaging/signing/privacy unit tests | 13 tests, zero failures; deliberate duplicate-ZIP fixture emits a Python warning |
 | Independent raw/bundled preferences | Eight restart reads pass, including custom prompt and Mode 2 |
 | Static checks | Python AST, shell syntax, Git whitespace and local documentation links pass |
 | Release privacy regression | Prior binary archive correctly rejected for embedded developer paths |
+| Universal release compilation | arm64 and x86_64 pass, 31.84s; both slices retain macOS 14.0 minimum |
+| Final local package and installation | Signed 0.3.0 package passes strict signature checks, ZIP CRCs and privacy scanning; installed executable matches the archive |
+| Clean source snapshot | Generic-author history; ZIP exactly matches tracked files except the restricted font binary; no Git/runtime/build data |
+| Final process/Spotlight inventory | One running process and one indexed Harness.app, the canonical installation |
 
 The unavailable optional screenshots are explicitly skipped. Generated light/dark/faint-seam/Retina cases execute; skipped references are not counted as successful real-image comparisons. Automated tests use generated images/windows and mock transport; they do not acquire desktop content or spend plan allowance.
 
 ## Release acceptance
 
-Final package/installation checks are recorded after staging and signature verification. A clean source ZIP excludes Git/runtime/build output and the restricted font binary; source recipients obtain their own Satoshi Regular OTF. The build blueprint documents reconstruction and native port contracts; **Windows/Linux implementations are not delivered by this repository**.
+The final local executable was built from revision `890c3f5`. Its compiler prefix maps and stripped debugging data pass the release privacy gate, and the staged, archived and installed signatures verify. The package build emitted warnings about unavailable remapped module-cache paths while generating debugging data; that debugging output is excluded from the signed release. The installed Advanced UI exposes the system-prompt editor and existing Mode 2, shortcuts and Screen Recording permission load correctly. Saved-account recovery is awaiting a protected Keychain grant; startup alone did not trigger a dialog. Account readiness and repeated restarts of this final executable are not yet verified.
+
+A clean source ZIP excludes Git/runtime/build output and the restricted font binary; source recipients obtain their own Satoshi Regular OTF. Recovery history is kept outside the shareable project. The build blueprint documents reconstruction and native port contracts; **Windows/Linux implementations are not delivered by this repository**.
 
 Public distribution requires the publisher's stable Developer ID identity and successful notarization, stapling and Gatekeeper acceptance. The local development build does not satisfy that external signing gate. A local self-signed executable update can require a new protected Keychain grant even after Always Allow; quiet ordinary reads suppress dialogs and explicit recovery is responsive. App code cannot override native authorization or complete protected system prompts.
 
