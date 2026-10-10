@@ -1,0 +1,13 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Harness authorized full-screen fixture</title>
+<style>body{margin:0;background:#101824;color:#e9f1fc;font:16px system-ui;padding:36px}button{padding:12px 18px;margin:8px;background:#65ddc2;border:0;border-radius:8px;color:#10211f}pre{background:#1a2636;padding:20px;border-radius:12px;white-space:pre-wrap;height:55vh;overflow:auto}.badge{color:#65ddc2}section{background:#101824;padding:16px}</style>
+<section id="fixture"><h1>Harness full-screen measurement</h1><p class="badge">Controlled local fixture · no external resources · no JavaScript injection</p>
+<p>Physically use your configured capture/dismiss/up/down keys (defaults F8/F9/F10/F11). Record normal mode, macOS native full-screen and HTML5 full-screen separately. This page observes only its own focus, visibility and keyboard events.</p>
+<button id="enter">Enter HTML5 full-screen</button><button id="exit">Exit fixture full-screen</button><button id="clear">Clear visible events</button><pre id="events"></pre></section>
+<script>
+const output=document.querySelector('#events');let sequence=0;
+function log(kind,extra={}){const entry={sequence:++sequence,time:new Date().toISOString(),monotonic_ms:performance.now(),kind,fullscreen:!!document.fullscreenElement,focus:document.hasFocus(),visibility:document.visibilityState,...extra};output.textContent+=JSON.stringify(entry)+'\n';if(output.textContent.length>100000)output.textContent=output.textContent.slice(-80000);output.scrollTop=output.scrollHeight;}
+document.querySelector('#enter').onclick=()=>document.querySelector('#fixture').requestFullscreen().catch(e=>log('request_error',{name:e.name}));
+document.querySelector('#exit').onclick=()=>document.fullscreenElement&&document.exitFullscreen();document.querySelector('#clear').onclick=()=>{output.textContent='';log('cleared');};
+window.addEventListener('focus',()=>log('focus'));window.addEventListener('blur',()=>log('blur'));document.addEventListener('visibilitychange',()=>log('visibilitychange'));document.addEventListener('fullscreenchange',()=>log('fullscreenchange'));document.addEventListener('fullscreenerror',()=>log('fullscreenerror'));
+for(const type of ['keydown','keyup'])document.addEventListener(type,e=>log(type,{key:e.key,code:e.code,repeat:e.repeat,ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey,meta:e.metaKey}));log('ready',{user_agent:navigator.userAgent});
+</script></html>
