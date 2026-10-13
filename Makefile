@@ -3,17 +3,19 @@ export DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
 export PYTHONDONTWRITEBYTECODE := 1
 SCRATCH ?= /private/tmp/harness-build
 
-.PHONY: help build test test-native check package install icon preferences signing-tests source privacy
+.PHONY: help build test test-native test-capture check package install icon preferences signing-tests source privacy
 help:
-	@printf '%s\n' 'build · test · test-native · check · package · install · icon · preferences · signing-tests · source · privacy'
+	@printf '%s\n' 'build · test · test-native · test-capture · check · package · install · icon · preferences · signing-tests · source · privacy'
 build:
 	swift build --scratch-path "$(SCRATCH)"
 test:
 	swift test --scratch-path "$(SCRATCH)"
 test-native:
 	HARNESS_RUN_OVERLAY_GUI_TESTS=1 swift test --scratch-path "$(SCRATCH)"
+test-capture:
+	HARNESS_RUN_OVERLAY_GUI_TESTS=1 HARNESS_RUN_NATIVE_CAPTURE_TESTS=1 swift test --scratch-path "$(SCRATCH)"
 check:
-	HARNESS_SCRATCH="$(SCRATCH)" ./scripts/check.sh
+	HARNESS_SCRATCH="$(SCRATCH)" zsh ./scripts/check.sh
 package:
 	HARNESS_PACKAGE_SCRATCH="$(SCRATCH)" ./scripts/package.sh
 install:

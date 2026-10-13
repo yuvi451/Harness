@@ -2,6 +2,71 @@ import XCTest
 @testable import HarnessCore
 @testable import HarnessEmitter
 @MainActor final class SubmissionTests: XCTestCase {
+    func testEmptyOrWhitespaceOnlyCompletionCannotPublishOrEnterHistory() async throws {
+        for answer in [""," \n\t\r "] {
+            let privacy = PrivacyController();try await privacy.grantConsent(acknowledged:true)
+            let log = SubmissionAudit()
+            let service = RemoteSubmissionService(privacy:privacy,audit:log) { _,_ in SubmissionProvider(chunks:[answer]) }
+            let image = ProcessedImage(bytes:Data([1]),width:1,height:1,sha256:String(repeating:"a",count:64),masksApplied:false)
+            var published = false
+            do {
+                _ = try await service.submit(image:image,settings:Settings(),prompt:"Answer",captureID:UUID(),
+                    credential:"synthetic",source:.excludingSelf,selectedWindowID:nil) { _,_ in published = true }
+                XCTFail("An empty answer must be classified as incomplete")
+            } catch { XCTAssertTrue(error is SubmissionError) }
+            let history = await privacy.history,bytes = await privacy.retainedImageByteCount,events = await log.events
+            XCTAssertFalse(published);XCTAssertTrue(history.isEmpty);XCTAssertEqual(bytes,0)
+            XCTAssertEqual(events.map(\.name),[.llmRequest,.llmFailed])
+        }
+    }
+    func testBatchAuditsEveryCaptureAndReleasesAllImageReferences() async throws {
+        let privacy = PrivacyController(); try await privacy.grantConsent(acknowledged:true)
+        let log = SubmissionAudit(); let provider = BatchSubmissionProvider()
+        let service = RemoteSubmissionService(privacy:privacy,audit:log) { _,_ in provider }
+        let entries = (UInt8(1)...3).map { QueuedScreenshot(id:UUID(),image:ProcessedImage(bytes:Data([$0]),width:1,height:1,sha256:String(repeating:"a",count:64),masksApplied:false)) }
+        let result = try await service.submit(images:entries,settings:Settings(),prompt:"Answer together",credential:"synthetic",
+                                              source:.excludingSelf,selectedWindowID:nil)
+        XCTAssertEqual(provider.received,entries.map { $0.image.bytes })
+        XCTAssertEqual(result.response,"Batch answer")
+        let records = await log.events
+        XCTAssertEqual(records.first?.payload["capture_ids"],.array(entries.map { .string($0.id.uuidString) }))
+        XCTAssertEqual(records.first?.payload["image_count"],.integer(3))
+        let bytes = await privacy.retainedImageByteCount; XCTAssertEqual(bytes,0)
+        let history = await privacy.history; XCTAssertEqual(history.count,1)
+    }
+    func testOneUnsafeImageBlocksWholeBatchBeforeProviderCreation() async throws {
+        let privacy = PrivacyController(); try await privacy.grantConsent(acknowledged:true)
+        var created = false
+        let service = RemoteSubmissionService(privacy:privacy,audit:SubmissionAudit()) { _,_ in created = true; return BatchSubmissionProvider() }
+        var settings = Settings(); settings.privacyMaskingEnabled = true; settings.maskingRegions = [.init(x:0,y:0,width:1,height:1)]
+        let images = [true,false].map { QueuedScreenshot(id:UUID(),image:ProcessedImage(bytes:Data([1]),width:1,height:1,sha256:"",masksApplied:$0)) }
+        do { _ = try await service.submit(images:images,settings:settings,prompt:"Answer",credential:"synthetic",source:.excludingSelf,selectedWindowID:nil); XCTFail() }
+        catch { XCTAssertEqual(error as? PrivacyError,.maskingRequired) }
+        XCTAssertFalse(created)
+        let bytes = await privacy.retainedImageByteCount; XCTAssertEqual(bytes,0)
+    }
+    func testSingleGraphemeAnswerCannotBypassTheResponseByteLimit() async throws {
+        let privacy = PrivacyController(); try await privacy.grantConsent(acknowledged: true)
+        let log = SubmissionAudit()
+        let answer = "a" + String(repeating: "\u{301}", count: 200_000)
+        XCTAssertEqual(answer.count, 1)
+        let service = RemoteSubmissionService(privacy: privacy, audit: log) { _, _ in
+            SubmissionProvider(chunks: [answer])
+        }
+        var settings = Settings(); settings.networkSubmissionEnabled = true
+        let image = ProcessedImage(bytes: Data([1]), width: 1, height: 1, sha256: String(repeating: "a", count: 64), masksApplied: false)
+        var displayed = false
+        do {
+            _ = try await service.submit(image: image, settings: settings, prompt: "Answer", captureID: UUID(),
+                credential: "synthetic", source: .excludingSelf, selectedWindowID: nil) { _, _ in displayed = true }
+            XCTFail("Response exceeded the byte budget")
+        } catch { XCTAssertEqual(error as? PrivacyError, .responseTooLarge) }
+        let history = await privacy.history, retained = await privacy.retainedImageByteCount
+        XCTAssertTrue(history.isEmpty); XCTAssertEqual(retained, 0); XCTAssertFalse(displayed)
+        let events = await log.events
+        XCTAssertEqual(events.map(\.name), [.llmRequest, .llmFailed])
+    }
+
     func testSubmissionPassesCustomInstructionsThroughProviderFactoryWithoutAuditingText() async throws {
         let privacy = PrivacyController(); try await privacy.grantConsent(acknowledged:true)
         let log = SubmissionAudit(); var received = ""
@@ -122,6 +187,15 @@ import XCTest
         }
     }
 
+}
+private final class BatchSubmissionProvider: LLMProvider, @unchecked Sendable {
+    var received:[Data] = []
+    var completionSummary:LLMCompletion? { .init(stopReason:"completed",latencyMS:1) }
+    func stream(prompt:String,image:Data,history:[LLMExchange]) -> AsyncThrowingStream<String,Error> { stream(prompt:prompt,images:[image],history:history) }
+    func stream(prompt:String,images:[Data],history:[LLMExchange]) -> AsyncThrowingStream<String,Error> {
+        received = images
+        return AsyncThrowingStream { $0.yield("Batch answer"); $0.finish() }
+    }
 }
 private final class SubmissionProvider: LLMProvider {
     let chunks: [String], complete: Bool, failure: Error?

@@ -3,6 +3,60 @@ import XCTest
 @testable import HarnessEmitter
 
 final class ChatGPTProviderTests: XCTestCase {
+    func testBatchUsesOneRequestWithAllImagesInCaptureOrder() async throws {
+        let fixture = ChatGPTFixture(); defer { fixture.close() }
+        let provider = ChatGPTProvider(token:token,model:model,session:fixture.session)
+        let images = [Data([1,2]),Data([3,4]),Data([5,6])]
+        var text = ""
+        for try await delta in provider.stream(prompt:"Answer these captures together.",images:images,history:[]) { text += delta }
+        XCTAssertEqual(text,"Hello")
+        XCTAssertEqual(fixture.requests.filter { $0.httpMethod == "POST" }.count,1)
+        let post = try XCTUnwrap(fixture.requests.last)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with:ChatGPTFixture.body(post)) as? [String:Any])
+        let input = try XCTUnwrap(object["input"] as? [[String:Any]])
+        let content = try XCTUnwrap(input.last?["content"] as? [[String:Any]])
+        XCTAssertEqual(content.compactMap { $0["image_url"] as? String },images.map { "data:image/jpeg;base64," + $0.base64EncodedString() })
+        XCTAssertEqual(object["store"] as? Bool,false)
+    }
+    func testInvalidBatchCannotEvenRequestModelCatalog() async throws {
+        for images in [[],[Data()],[Data(repeating:1,count:1_000_001)],Array(repeating:Data([1]),count:7)] {
+            let fixture = ChatGPTFixture(); defer { fixture.close() }
+            let provider = ChatGPTProvider(token:token,model:model,session:fixture.session)
+            do {
+                for try await _ in provider.stream(prompt:"Answer",images:images,history:[]) {}
+                XCTFail("Invalid image batch accepted")
+            } catch { XCTAssertEqual(error as? ChatGPTProviderError,.invalidImage) }
+            XCTAssertTrue(fixture.requests.isEmpty)
+        }
+    }
+    func testCombiningMarkDeltasCannotBypassTheResponseByteLimit() async {
+        let fixture = ChatGPTFixture(); defer { fixture.close() }
+        let delta = "a" + String(repeating: "\u{301}", count: 9_999)
+        XCTAssertEqual(delta.count, 1)
+        let deltas = (0..<21).map { _ in
+            ChatGPTFixture.event("response.output_text.delta", ["delta": delta, "output_index": 0, "content_index": 0, "item_id": "msg_test"])
+        }
+        fixture.events = ChatGPTFixture.stream([
+            ChatGPTFixture.event("response.created", ["response": ["id": "resp_test", "model": model, "status": "in_progress"]])
+        ] + deltas + [
+            ChatGPTFixture.event("response.completed", ["response": ["id": "resp_test", "model": model, "status": "completed"]])
+        ])
+        let provider = ChatGPTProvider(token: token, model: model, session: fixture.session)
+        do { _ = try await collect(provider); XCTFail("Response exceeded the byte budget") }
+        catch { XCTAssertEqual(error as? ChatGPTProviderError, .responseTooLarge) }
+        XCTAssertNil(provider.completionSummary)
+    }
+
+    func testMalformedBearerTokensCannotStartNetwork() async {
+        for value in ["synthetic\tvalue", "synthetic\u{0}value", "synthetic\u{7f}value", "synthetic\u{a0}value"] {
+            let fixture = ChatGPTFixture(); defer { fixture.close() }
+            let provider = ChatGPTProvider(token: value, model: model, session: fixture.session)
+            do { _ = try await collect(provider); XCTFail("Malformed bearer token accepted") }
+            catch { XCTAssertEqual(error as? ChatGPTProviderError, .invalidAccount) }
+            XCTAssertTrue(fixture.requests.isEmpty, "Malformed credentials must fail before creating a request")
+        }
+    }
+
     func testCustomSystemPromptReplacesDefaultAndPreservesScreenshotBoundaryOnWire() async throws {
         let fixture = ChatGPTFixture(); defer { fixture.close() }
         let prompt = "Give a short explanation in French.\né🙂"

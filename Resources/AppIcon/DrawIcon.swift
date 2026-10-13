@@ -1,6 +1,6 @@
 import AppKit
 
-// Matches logo.svg. Render at explicit pixel sizes so icon generation is
+// Render the procedural icon at explicit pixel sizes so generation is
 // independent of the display's Retina scale. No fonts or external assets.
 let output = URL(fileURLWithPath: CommandLine.arguments[1])
 let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1024, pixelsHigh: 1024,

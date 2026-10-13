@@ -162,6 +162,10 @@ public enum GroundTruthCorrelator {
             }
             let observations = rows.compactMap(\.observation)
             guard observations.count == summary.windowCount else { issues.append(.init(code: .incompleteScan, scanID: scanID)); indeterminate += 1; continue }
+            let windowIDs = observations.compactMap(\.windowID)
+            guard Set(windowIDs).count == windowIDs.count else {
+                issues.append(.init(code: .incompleteScan, scanID: scanID)); indeterminate += 1; continue
+            }
             let actualFlagged = observations.filter { $0.classifications.contains(where: { [.legacyNonsharingSignal,.metadataIncomplete,.unknown,.unsupported].contains($0) }) }.count
             guard actualFlagged == summary.flaggedCount else { issues.append(.init(code: .incompleteScan, scanID: scanID)); indeterminate += 1; continue }
             validScans.append(summary); rowsByScan[scanID] = observations
@@ -199,7 +203,10 @@ public enum GroundTruthCorrelator {
             else if scans.count > 1 { add(.ambiguous); indeterminate += 1 }
             else if let scan, let context = scan.context, let terminal {
                 let identities = ["window_id","owner_pid","source"]
+                let displayConflict = start.payload["display_id"]?.int != nil && terminal.payload["display_id"] != nil &&
+                    start.payload["display_id"] != terminal.payload["display_id"]
                 if terminal.sequence <= start.sequence || terminal.mode != start.mode ||
+                    displayConflict ||
                     identities.contains(where: { start.payload[$0] == nil || terminal.payload[$0] != start.payload[$0] }) ||
                     start.payload["window_id"]?.int != context.targetWindowID || start.payload["owner_pid"]?.int != context.ownerPID ||
                     start.mode != context.mode.rawValue || rawSource != context.source.rawValue ||
@@ -227,6 +234,7 @@ public enum GroundTruthCorrelator {
                         else if rows.contains(where: { $0.windowID == nil || $0.ownerPID == nil }) { add(.unsupported); indeterminate += 1 }
                         else {
                             detected = !sameID.isEmpty; matched += 1; status = fatalDataset ? "indeterminate" : "observed"
+                            if fatalDataset { indeterminate += 1 }
                             sampleTruth = context.independentTruth
                             if let truth = sampleTruth, !fatalDataset {
                                 var values = counts[configuration] ?? [0,0,0,0]

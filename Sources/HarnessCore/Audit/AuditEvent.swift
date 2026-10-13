@@ -44,7 +44,7 @@ public struct AuditEvent: Codable, Equatable, Sendable {
         let required: [String: String]
         switch name {
         case .modeChanged: required = ["from":"mode", "to":"mode"]
-        case .captureStarted: required = ["source":"source", "display_id":"int"]
+        case .captureStarted: required = ["source":"source", "display_id":"nullableDisplay"]
         case .captureCompleted: required = ["bytes":"positive", "width":"positive", "height":"positive", "sha256":"hash", "overlay_in_capture":"nullableBool", "calibration_status":"string", "calibration_reason":"string"]
         case .llmRequest: required = ["provider":"string", "model":"string", "prompt_chars":"int"]
         case .llmCompleted: required = ["stop_reason":"string", "out_chars":"int", "latency_ms":"numeric"]
@@ -53,7 +53,7 @@ public struct AuditEvent: Codable, Equatable, Sendable {
         case .detectorScan: required = ["n_windows":"int", "n_flagged":"int"]
         default: required = [:]
         }
-        let extras: Set<String> = ["status", "reason", "code", "source", "capture_id", "window_id", "owner_pid", "scan_id", "step_id", "configuration_id", "latency_ms", "confidence", "calibration_status", "calibration_reason", "overlay_visibility", "changed_keys", "network_enabled", "consent", "scope", "shortcut", "action", "requested", "observed", "sharing", "level", "collection_behavior", "capability", "permission", "app_version", "environment", "load_issues", "monotonic_ns", "configuration_changed_ns", "bytes", "display_id", "supported_models", "browser", "browser_version", "message", "mask_count"]
+        let extras: Set<String> = ["status", "reason", "code", "source", "capture_id", "capture_ids", "image_count", "window_id", "owner_pid", "scan_id", "step_id", "configuration_id", "latency_ms", "confidence", "calibration_status", "calibration_reason", "overlay_visibility", "changed_keys", "network_enabled", "consent", "scope", "shortcut", "action", "requested", "observed", "sharing", "level", "collection_behavior", "capability", "permission", "app_version", "environment", "load_issues", "monotonic_ns", "configuration_changed_ns", "bytes", "display_id", "supported_models", "browser", "browser_version", "message", "mask_count"]
         guard payload.count <= 40, Set(payload.keys).isSubset(of: Set(required.keys).union(extras)) else { throw AuditError.schema }
         for (key, type) in required {
             guard let value = payload[key] else { throw AuditError.schema }
@@ -65,9 +65,14 @@ public struct AuditEvent: Codable, Equatable, Sendable {
             case "int", "positive": guard let n = value.int, n >= (type == "positive" ? 1 : 0) else { throw AuditError.schema }
             case "numeric": guard value.int != nil || { if case .number(let n) = value { return n.isFinite }; return false }() else { throw AuditError.schema }
             case "nullableBool": guard value == .null || value.boolean != nil else { throw AuditError.schema }
+            case "nullableDisplay":
+                guard value == .null || value.int.map({ $0 > 0 && $0 <= Int(UInt32.max) }) == true else { throw AuditError.schema }
             case "dismiss": guard let s = value.string, ["hotkey", "timeout", "recapture", "account_disconnect"].contains(s) else { throw AuditError.schema }
             default: throw AuditError.schema
             }
+        }
+        if name == .captureCompleted, let display = payload["display_id"] {
+            guard let id = display.int, id > 0, id <= Int(UInt32.max) else { throw AuditError.schema }
         }
         func bounded(_ value: JSONValue, depth: Int = 0) -> Bool {
             guard depth < 5 else { return false }

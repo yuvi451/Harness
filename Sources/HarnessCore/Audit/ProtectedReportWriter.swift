@@ -20,6 +20,8 @@ public enum ProtectedReportWriter {
               info.st_uid == getuid(), info.st_nlink == 1 else { throw AuditError.unsafeFile }
         try BoundedFileLock.acquire(descriptor, operation: LOCK_EX, timeoutSeconds: lockTimeoutSeconds)
         defer { _ = flock(descriptor,LOCK_UN) }
+        guard fstat(descriptor,&info) == 0, info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == getuid(), info.st_nlink == 1 else { throw AuditError.unsafeFile }
         guard fchmod(descriptor,0o600) == 0, ftruncate(descriptor,0) == 0 else { throw AuditError.io(errno) }
         let data = Data(text.utf8)
         if !data.isEmpty {

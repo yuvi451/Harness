@@ -74,6 +74,7 @@ public struct ImageProcessor {
             for quality in qualityLevels {
                 try Task.checkCancellation()
                 let encoded = try encoder.encode(rendered, quality: quality)
+                try Task.checkCancellation()
                 guard !encoded.isEmpty else { throw ImageProcessingError.encodingFailed }
                 if encoded.count <= settings.maxImageBytes {
                     let hash = SHA256.hash(data: encoded).map { String(format: "%02x", $0) }.joined()

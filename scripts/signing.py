@@ -5,6 +5,7 @@ Private material ends in a dedicated encrypted Keychain. Only its password is st
 in a precisely named login-Keychain item. Temporary private files are removed.
 """
 import hashlib
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -31,7 +32,10 @@ class Signer:
         self.runner, self.temp_root = runner, temp_root
 
     def run(self, *args, missing=False, binary=False):
-        result = self.runner(list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=not binary)
+        try:
+            result = self.runner(list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=not binary, timeout=120)
+        except (subprocess.TimeoutExpired, OSError):
+            raise SigningError('Local signing tool did not complete; credential details were suppressed.') from None
         if missing and result.returncode == 44:
             return None
         if result.returncode:
@@ -55,6 +59,26 @@ class Signer:
         return hashlib.sha1(der).hexdigest().upper()
 
     def identity(self):
+        if not self.directory.is_dir() or self.directory.is_symlink():
+            raise SigningError('Expected the user Keychains directory.')
+        lock_path = self.directory/'org.harness.research.signing.lock'
+        try:
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+        except OSError:
+            raise SigningError('Local signing lock is unavailable.') from None
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+                raise SigningError('Unsafe local signing lock.')
+            os.fchmod(descriptor, 0o600)
+            try: fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise SigningError('Another local signing setup is active; retry after it finishes.') from None
+            return self._identity()
+        finally:
+            os.close(descriptor)
+
+    def _identity(self):
         password = self.run('/usr/bin/security', 'find-generic-password', '-s', SERVICE, '-a', ACCOUNT, '-w', str(self.login), missing=True)
         present = (self.keychain.exists() or self.keychain.is_symlink(), self.metadata.exists() or self.metadata.is_symlink(), password is not None)
         if any(present) and not all(present):

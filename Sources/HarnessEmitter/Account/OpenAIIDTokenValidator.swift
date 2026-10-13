@@ -17,7 +17,9 @@ public struct OpenAIIDTokenValidator {
               let nString = jwk["n"] as? String, let eString = jwk["e"] as? String,
               let modulus = Data(oauthBase64URL: nString), let exponent = Data(oauthBase64URL: eString),
               (256...512).contains(modulus.count), (1...4).contains(exponent.count), signature.count == modulus.count else { throw ChatGPTAuthenticationError.invalidIdentity }
-        if let ops = jwk["key_ops"] as? [String], !ops.contains("verify") { throw ChatGPTAuthenticationError.invalidIdentity }
+        if let value = jwk["key_ops"] {
+            guard let operations = value as? [String], operations.contains("verify") else { throw ChatGPTAuthenticationError.invalidIdentity }
+        }
         let der = Self.der(0x30, Self.integer(modulus) + Self.integer(exponent))
         var securityError: Unmanaged<CFError>?
         guard let key = SecKeyCreateWithData(der as CFData, [kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeyClass: kSecAttrKeyClassPublic,

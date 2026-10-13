@@ -16,7 +16,15 @@ public enum OverlayStyle: Sendable, Equatable {
         switch self {
         case .dark: return .white
         case .light: return .black
-        case let .sampled(r,g,b): return Int(r)*2126 + Int(g)*7152 + Int(b)*722 > 127*10000 ? .black : .white
+        case let .sampled(r,g,b):
+            func linear(_ value:UInt8) -> Double {
+                let channel = Double(value)/255
+                return channel <= 0.04045 ? channel/12.92 : pow((channel+0.055)/1.055,2.4)
+            }
+            let luminance = linear(r)*0.2126 + linear(g)*0.7152 + linear(b)*0.0722
+            let blackContrast = (luminance+0.05)/0.05
+            let whiteContrast = 1.05/(luminance+0.05)
+            return blackContrast >= whiteContrast ? .black : .white
         }
     }
     @MainActor var font: NSFont { OverlayTypography.font }

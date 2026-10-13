@@ -18,6 +18,37 @@ import XCTest
 }
 
 final class SettingsTests: XCTestCase {
+    func testLegacyFunctionBindingsPreserveTheirUsableNumbersAndRemovedModeFallsBack() async throws {
+        let data = Data("{\"captureHotkey\":{\"functionKey\":8},\"dismissHotkey\":{\"functionKey\":9},\"scrollUpHotkey\":{\"functionKey\":7},\"scrollDownHotkey\":{\"functionKey\":6},\"queueCaptureHotkey\":{\"functionKey\":5},\"overlayPosition\":\"retired-mode\"}".utf8)
+        let decoded = try JSONDecoder().decode(Settings.self,from:data)
+        XCTAssertEqual([decoded.captureHotkey.digit,decoded.dismissHotkey.digit,decoded.scrollUpHotkey.digit,decoded.scrollDownHotkey.digit,decoded.queueCaptureHotkey.digit],[8,9,7,6,5])
+        XCTAssertEqual(decoded.overlayPosition,.nearCursor)
+        try await MainActor.run {
+            let prefs = MemoryPreferences(["captureHotkey":8,"dismissHotkey":9,"scrollUpHotkey":7,"scrollDownHotkey":6,"queueCaptureHotkey":5])
+            let store = SettingsStore(preferences:prefs)
+            try store.save(store.settings)
+            XCTAssertEqual(prefs.values["shortcutSchemaVersion"] as? Int,1)
+            XCTAssertEqual(SettingsStore(preferences:prefs).settings,store.settings)
+        }
+    }
+    func testLegacyCodableSettingsDefaultNewFeaturesWithoutDataLoss() throws {
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with:JSONEncoder().encode(Settings())) as? [String:Any])
+        object.removeValue(forKey:"adaptiveTypographyEnabled");object.removeValue(forKey:"queueCaptureHotkey")
+        let migrated = try JSONDecoder().decode(Settings.self,from:JSONSerialization.data(withJSONObject:object))
+        XCTAssertFalse(migrated.adaptiveTypographyEnabled);XCTAssertEqual(migrated.queueCaptureHotkey.digit,5)
+        XCTAssertEqual(migrated.captureHotkey.digit,8)
+    }
+    func testNewPreferencesSurviveSaveWithoutResettingExistingNumberSevenBinding() async throws {
+        try await MainActor.run {
+            let prefs = MemoryPreferences(["adaptiveTypographyEnabled":true,"captureHotkey":7])
+            let store = SettingsStore(preferences:prefs)
+            try store.save(store.settings)
+            XCTAssertEqual(prefs.values["adaptiveTypographyEnabled"] as? Bool,true)
+            XCTAssertEqual(prefs.values["captureHotkey"] as? Int,7)
+            let queue = try XCTUnwrap(prefs.values["queueCaptureHotkey"] as? Int)
+            XCTAssertNotEqual(queue,7)
+        }
+    }
     func testSystemPromptSurvivesCodableAndPreferenceRoundTrips() async throws {
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with:JSONEncoder().encode(Settings())) as? [String:Any])
         let prompt = "Use concise answers.\nKeep Unicode: é🙂."
@@ -78,10 +109,10 @@ final class SettingsTests: XCTestCase {
             defer { defaults.removePersistentDomain(forName: domain) }
             let first = SettingsStore(preferences: UserDefaultsPreferences(domain: domain))
             var candidate = first.settings
-            candidate.captureHotkey = Shortcut(functionKey: 11)
-            candidate.dismissHotkey = Shortcut(functionKey: 12)
-            candidate.scrollUpHotkey = Shortcut(functionKey: 13)
-            candidate.scrollDownHotkey = Shortcut(functionKey: 14)
+            candidate.captureHotkey = Shortcut(digit: 2)
+            candidate.dismissHotkey = Shortcut(digit: 9)
+            candidate.scrollUpHotkey = Shortcut(digit: 3)
+            candidate.scrollDownHotkey = Shortcut(digit: 4)
             candidate.model = "saved-custom-model"
             candidate.overlayPosition = .pinnedCorner
             candidate.visibilityMode = .legacySharingProbe
@@ -150,10 +181,10 @@ final class SettingsTests: XCTestCase {
         try await MainActor.run {
             let store = SettingsStore(preferences: MemoryPreferences())
             let s = store.settings
-            XCTAssertEqual(s.captureHotkey.label, "F8")
-            XCTAssertEqual(s.dismissHotkey.label, "F9")
-            XCTAssertEqual(s.scrollUpHotkey.label, "F10")
-            XCTAssertEqual(s.scrollDownHotkey.label, "F11")
+            XCTAssertEqual(s.captureHotkey.label, "⌥⇧8")
+            XCTAssertEqual(s.dismissHotkey.label, "⌥⇧9")
+            XCTAssertEqual(s.scrollUpHotkey.label, "⌥⇧7")
+            XCTAssertEqual(s.scrollDownHotkey.label, "⌥⇧6")
             XCTAssertEqual(s.provider.rawValue, "ChatGPT plan")
             XCTAssertEqual(s.model, "gpt-6.1-sol")
             XCTAssertEqual(s.overlayPosition, .nearCursor)
@@ -202,8 +233,8 @@ final class SettingsTests: XCTestCase {
             ])
             let store = SettingsStore(preferences: prefs)
             XCTAssertEqual(store.settings.model, "valid-model")
-            XCTAssertEqual(store.settings.captureHotkey.functionKey, 8)
-            XCTAssertEqual(store.settings.dismissHotkey.functionKey, 9)
+            XCTAssertEqual(store.settings.captureHotkey.digit, 8)
+            XCTAssertEqual(store.settings.dismissHotkey.digit, 9)
             XCTAssertEqual(store.settings.historyLength, 10)
             XCTAssertFalse(store.settings.calibrationEnabled)
             XCTAssertTrue(store.settings.networkSubmissionEnabled)
@@ -231,17 +262,17 @@ final class SettingsTests: XCTestCase {
             let store = SettingsStore(preferences: MemoryPreferences([
                 "captureHotkey": 9, "dismissHotkey": 9, "scrollUpHotkey": 12
             ]))
-            XCTAssertEqual(store.settings.captureHotkey.functionKey, 8)
-            XCTAssertEqual(store.settings.dismissHotkey.functionKey, 9)
-            XCTAssertEqual(store.settings.scrollUpHotkey.functionKey, 12)
+            XCTAssertEqual(store.settings.captureHotkey.digit, 8)
+            XCTAssertEqual(store.settings.dismissHotkey.digit, 9)
+            XCTAssertEqual(store.settings.scrollUpHotkey.digit, 7)
             XCTAssertFalse(store.loadIssues.isEmpty)
         }
     }
 
     func testNumericAndModelValidation() {
         let invalidMutations: [(inout Settings) -> Void] = [
-            { $0.captureHotkey = Shortcut(functionKey: 0) },
-            { $0.dismissHotkey = Shortcut(functionKey: 21) },
+            { $0.captureHotkey = Shortcut(digit: 0) },
+            { $0.dismissHotkey = Shortcut(digit: 21) },
             { $0.historyLength = -1 }, { $0.historyLength = 11 },
             { $0.maxImageDimension = 63 }, { $0.maxImageDimension = 1569 },
             { $0.maxImageBytes = 9_999 }, { $0.maxImageBytes = 1_000_001 },
@@ -308,7 +339,7 @@ final class SettingsTests: XCTestCase {
             let prefs = MemoryPreferences()
             let store = SettingsStore(preferences: prefs)
             var s = Settings()
-            s.captureHotkey = Shortcut(functionKey: 12)
+            s.captureHotkey = Shortcut(digit: 2)
             s.overlayPosition = .pinnedCorner
             s.captureSource = .selectedWindow
             s.selectedWindowID = 321
@@ -357,7 +388,7 @@ final class SettingsTests: XCTestCase {
             let store = SettingsStore(preferences: UserDefaultsPreferences(defaults))
             var s = store.settings
             s.historyLength = 2
-            s.captureHotkey = Shortcut(functionKey: 20)
+            s.captureHotkey = Shortcut(digit: 2)
             s.selectedWindowID = UInt32.max
             s.privacyMaskingEnabled = true
             s.maskingRegions = [MaskRegion(x: 0, y: 0, width: 0.5, height: 0.5)]

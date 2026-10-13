@@ -10,14 +10,23 @@ import HarnessCore
     private let capture: CaptureService
     private let hotkeys: HotkeyManager
     private let gate = SingleFlightCaptureGate()
+    private let screenshotBatch = ScreenshotBatch()
+    private var queuedPresentation:PreparedCapture?
+    private var answerPresentation:AnswerPresentation?
+    private var overlayModeTask:Task<Void,Never>?
+    private var queueExpiryTask:Task<Void,Never>?
+    private let providerFactory:@MainActor (String,Settings) -> any LLMProvider
+    var queuedScreenshotCount:Int { screenshotBatch.count }
     private let overlay = OverlayController()
     let settingsUI = SettingsWindowController()
     private let modelsLoader: @MainActor (String) async throws -> [String]
     private let windowsLoader: @MainActor () async throws -> [ShareableWindowChoice]
     private let screenPermissionGranted: @MainActor () -> Bool
     private let requestScreenPermission: @MainActor () -> Bool
+    private let displaySnapshot:@MainActor () -> [UInt32:CGRect]
     private var modes: VisibilityModeEngine?
     private var statusItem: NSStatusItem?
+    private var launchTask: Task<Void,Never>?
     private var operation: Task<Void,Never>?
     private var authentication: Task<Void,Never>?
     private var saveTask: Task<Void,Never>?
@@ -29,6 +38,7 @@ import HarnessCore
     private var authenticationGeneration: UInt64 = 0
     private(set) var ready = false
     private var launching = true
+    private var terminating = false
     private(set) var blocked = false
     private var presentationGeneration: UInt64 = 0
     private var settingsApplying = false
@@ -39,17 +49,20 @@ import HarnessCore
                 account: (any ApplicationAccountManaging)? = nil, hotkeys: HotkeyManager? = nil,
                 privacy: PrivacyController = PrivacyController(),
                 captureEngine: (any CaptureEngineProtocol)? = nil,
+                providerFactory:@escaping @MainActor (String,Settings) -> any LLMProvider = { ChatGPTProvider(token:$0,model:$1.model,systemPrompt:$1.effectiveSystemPrompt) },
                 modelsLoader: (@MainActor (String) async throws -> [String])? = nil,
                 windowsLoader: (@MainActor () async throws -> [ShareableWindowChoice])? = nil,
                 screenPermissionGranted: @escaping @MainActor () -> Bool = { CaptureService.screenRecordingPermissionGranted },
-                requestScreenPermission: @escaping @MainActor () -> Bool = { CaptureService.requestScreenRecordingPermissionFromSettings() }) throws {
+                requestScreenPermission: @escaping @MainActor () -> Bool = { CaptureService.requestScreenRecordingPermissionFromSettings() },
+                displaySnapshot:(@MainActor () -> [UInt32:CGRect])? = nil) throws {
         store = SettingsStore(preferences: preferences ?? UserDefaultsPreferences())
         self.account = account ?? ChatGPTAccountController()
-        self.privacy = privacy
+        self.privacy = privacy; self.providerFactory = providerFactory
         self.hotkeys = hotkeys ?? HotkeyManager()
         self.modelsLoader = modelsLoader ?? { try await ChatGPTProvider.availableModels(token: $0) }
         self.windowsLoader = windowsLoader ?? { [engine] in try await engine.refreshShareableWindows() }
         self.screenPermissionGranted = screenPermissionGranted; self.requestScreenPermission = requestScreenPermission
+        self.displaySnapshot = displaySnapshot ?? Self.displayFrames
         audit = AuditLogger(sink: try POSIXAuditSink(url:auditURL))
         capture = CaptureService(engine:captureEngine ?? engine)
         super.init()
@@ -58,23 +71,35 @@ import HarnessCore
     public func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenus(); wireSettings()
         account.onStatusChanged = { [weak self] in guard let self else { return }; self.refreshAccountUI() }
-        Task { await launch() }
+        launchTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.launchTask = nil }
+            await self.launch()
+        }
     }
     func launch() async {
+        guard !terminating else { return }
         defer { launching = false }
         settingsUI.allowModes()
         do {
+            try checkRunning()
             if account.isConnected && !store.settings.networkSubmissionEnabled {
                 var settings = store.settings; settings.networkSubmissionEnabled = true; try store.save(settings)
             }
             try await audit.record(.init(.appLaunch,payload:["app_version":.string(Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String ?? "development"),"environment":.object(EnvironmentCapabilityProbe().snapshot()),"source":.string(store.settings.captureSource.rawValue),"load_issues":.array(store.loadIssues.map(JSONValue.string)),"configuration_changed_ns":.integer(Int(configurationChangedNS))]),mode:store.settings.visibilityMode.rawValue)
+            try checkRunning()
             try await audit.record(.init(.permissionStatus,payload:["permission":.string("screen_recording"),"status":.string(screenPermissionGranted() ? "granted":"not_granted")]),mode:store.settings.visibilityMode.rawValue)
+            try checkRunning()
             if store.settings.networkSubmissionEnabled { try await privacy.grantConsent(acknowledged:true) }
+            try checkRunning()
             try await privacy.applyHistoryLimit(store.settings.historyLength)
+            try checkRunning()
             try await registerHotkeys(settings:store.settings)
+            try checkRunning()
             ready = !blocked && !accountDisconnecting && !settingsApplying; settingsUI.allowModes(); settingsUI.load(store.settings); refreshAccountUI()
             updateStatus(account.isConnected ? "Ready. Press \(store.settings.captureHotkey.label) to analyze your screen." : "Continue with ChatGPT to get started.")
-        } catch { if error is HotkeyError { ready = false; updateStatus(Self.safeMessage(error) + " Open Settings to choose other shortcuts.") } else { failClosed(error) } }
+        } catch is CancellationError { return }
+        catch { if error is HotkeyError { ready = false; updateStatus(Self.safeMessage(error) + " Open Settings to choose other shortcuts.") } else { failClosed(error) } }
         showSettings()
         if !blocked && !screenPermissionGranted() { settingsUI.onPermission?() }
     }
@@ -89,7 +114,7 @@ import HarnessCore
     }
     func wireSettings() {
         settingsUI.onSave = { [weak self] value,ack in
-            guard let self, self.saveTask == nil else { return }
+            guard let self, !self.terminating, self.saveTask == nil else { return }
             self.settingsUI.setBusy(true, for: .save)
             self.saveTask = Task { [weak self] in
                 guard let self else { return }
@@ -99,7 +124,7 @@ import HarnessCore
             }
         }
         settingsUI.onRefreshWindows = { [weak self] in
-            guard let self, self.windowsTask == nil else { return }
+            guard let self, !self.terminating, !self.blocked, self.windowsTask == nil else { return }
             self.settingsUI.setBusy(true, for: .refreshWindows)
             self.windowsTask = Task { [weak self] in
                 guard let self else { return }
@@ -109,7 +134,7 @@ import HarnessCore
             }
         }
         settingsUI.onPermission = { [weak self] in
-            guard let self, self.permissionTask == nil else { return }
+            guard let self, !self.terminating, !self.blocked, self.permissionTask == nil else { return }
             self.settingsUI.setBusy(true, for: .permission)
             let granted = self.screenPermissionGranted() || self.requestScreenPermission()
             self.settingsUI.setScreenRecordingPermission(granted:granted)
@@ -119,7 +144,7 @@ import HarnessCore
             }
         }
         settingsUI.onShowCalibration = { [weak self] in
-            guard let self, self.calibrationTask == nil else { return }
+            guard let self, !self.terminating, self.calibrationTask == nil else { return }
             self.settingsUI.setBusy(true, for: .calibration)
             self.calibrationTask = Task {
                 defer { self.calibrationTask = nil; self.settingsUI.setBusy(false, for: .calibration) }
@@ -135,17 +160,22 @@ import HarnessCore
             self.updateStatus("Sign-in cancelled. Continue with ChatGPT to retry.")
         }
         settingsUI.onChatGPTSignOut = { [weak self] in
-            guard let self, !self.accountDisconnecting else { return }
+            guard let self, !self.terminating, !self.accountDisconnecting else { return }
             self.accountDisconnecting = true
             self.settingsUI.setBusy(true, for: .signOut)
             self.authenticationGeneration &+= 1
             self.authentication?.cancel(); self.authentication = nil
             self.account.cancelSignIn(); self.settingsUI.setBusy(false, for: .signIn)
-            self.cancelModelRefresh(); self.saveTask?.cancel()
+            self.cancelModelRefresh(); self.saveTask?.cancel(); self.overlayModeTask?.cancel()
             self.operation?.cancel(); self.presentationGeneration &+= 1
-            self.settingsRevision &+= 1; self.ready = false; self.overlay.dismiss()
+            self.settingsRevision &+= 1; self.ready = false; self.discardAnswer(); self.clearQueuedCaptures()
             var settings = self.store.settings; settings.networkSubmissionEnabled = false
             self.settingsUI.revokeConsent()
+            // Disconnect local credentials even if preference or audit storage is unavailable.
+            // Remote revocation is owned by the account controller and may be retried manually.
+            var disconnectionFailed = false
+            do { try self.account.signOut(); self.refreshAccountUI() }
+            catch { disconnectionFailed = true }
             do { try self.store.save(settings); self.settingsUI.load(settings, preservingDraft:true) }
             catch { self.accountDisconnecting = false; self.settingsUI.setBusy(false, for: .signOut); self.failClosed(error); return }
             Task {
@@ -154,8 +184,7 @@ import HarnessCore
                 do {
                     try await self.audit.record(.init(.overlayDismissed,payload:["reason":.string("account_disconnect")]),mode:settings.visibilityMode.rawValue)
                     try await self.audit.record(.init(.settingsChanged,payload:["status":.string("account_disconnect"),"network_enabled":.bool(false)]),mode:settings.visibilityMode.rawValue)
-                    try self.account.signOut(); self.refreshAccountUI()
-                    self.updateStatus("Disconnected. Remote submission is disabled.")
+                    self.updateStatus(disconnectionFailed ? "Account disconnection failed. Remote submission is disabled; retry disconnection." : "Disconnected. Remote submission is disabled.")
                 } catch { if error is AuditError { self.failClosed(error) } else { self.updateStatus("Account disconnection failed. Remote submission is disabled; retry disconnection.") } }
             }
         }
@@ -166,11 +195,11 @@ import HarnessCore
         settingsUI.setAccountChoices(account.accountChoices,selectedID:account.selectedAccountID)
     }
     private func beginSignIn(newAccount:Bool = false, selectedClientID:String? = nil) {
-        guard authentication == nil, !settingsApplying, !accountDisconnecting else { return }
+        guard !terminating, !blocked, authentication == nil, overlayModeTask == nil, !settingsApplying, !accountDisconnecting else { return }
         if account.isConnected && !newAccount && selectedClientID == nil {
             updateStatus("ChatGPT is connected. Use \(store.settings.captureHotkey.label) to capture."); return
         }
-        cancelModelRefresh(); operation?.cancel(); presentationGeneration &+= 1; overlay.dismiss()
+        cancelModelRefresh(); operation?.cancel(); presentationGeneration &+= 1; discardAnswer(); clearQueuedCaptures()
         authenticationGeneration &+= 1; let generation = authenticationGeneration
         settingsUI.setBusy(true,for:.signIn)
         authentication = Task { [weak self] in
@@ -178,7 +207,7 @@ import HarnessCore
             defer {
                 if generation == self.authenticationGeneration {
                     self.authentication = nil; self.settingsUI.setBusy(false,for:.signIn)
-                    NSApp.activate(ignoringOtherApps:true); self.settingsUI.window?.makeKeyAndOrderFront(nil)
+                    if !self.terminating { NSApp.activate(ignoringOtherApps:true); self.settingsUI.window?.makeKeyAndOrderFront(nil) }
                 }
             }
             do {
@@ -205,13 +234,13 @@ import HarnessCore
             }
         }
     }
-    private func restoreReadiness() { ready = !blocked && !settingsApplying && !accountDisconnecting && !launching }
+    private func restoreReadiness() { ready = !terminating && !blocked && !settingsApplying && !accountDisconnecting && !launching }
     private func cancelModelRefresh() {
         modelGeneration &+= 1; modelTask?.cancel(); modelTask = nil
         settingsUI.setBusy(false, for: .refreshModels)
     }
     private func beginModelRefresh() {
-        guard modelTask == nil, !accountDisconnecting, !blocked else { return }
+        guard !terminating, modelTask == nil, !accountDisconnecting, !blocked else { return }
         modelGeneration &+= 1; let generation = modelGeneration
         settingsUI.setBusy(true, for: .refreshModels)
         modelTask = Task { [weak self] in
@@ -226,22 +255,35 @@ import HarnessCore
             } catch { if generation == self.modelGeneration, !Task.isCancelled { self.updateStatus("Could not retrieve account models. " + Self.safeMessage(error)) } }
         }
     }
-    private func registerHotkeys(settings:Settings) async throws {
+    private func checkRunning() throws {
+        try Task.checkCancellation()
+        guard !terminating else { throw CancellationError() }
+    }
+    private func registerHotkeys(settings:Settings, restoring:Bool = false) async throws {
+        func checkRegistration() throws {
+            guard !terminating else { throw CancellationError() }
+            if !restoring { try Task.checkCancellation() }
+        }
         do {
+            try checkRegistration()
             try hotkeys.configure(settings:settings) { [weak self] action in self?.physicalHotkey(action) }
-            for (action,key) in [("capture",settings.captureHotkey),("dismiss",settings.dismissHotkey),("scroll_up",settings.scrollUpHotkey),("scroll_down",settings.scrollDownHotkey)] {
+            for (action,key) in [("capture",settings.captureHotkey),("dismiss",settings.dismissHotkey),("scroll_up",settings.scrollUpHotkey),("scroll_down",settings.scrollDownHotkey),("queue_capture",settings.queueCaptureHotkey),("toggle_visibility",Settings.visibilityHotkey),("toggle_overlay_mode",Settings.overlayModeHotkey)] {
+                try checkRegistration()
                 try await audit.record(.init(.hotkeyRegistered,payload:["action":.string(action),"shortcut":.string(key.label)]),mode:settings.visibilityMode.rawValue)
             }
         } catch {
             hotkeys.shutdown()
+            if terminating || (!restoring && Task.isCancelled) { throw CancellationError() }
             try await audit.record(.init(.hotkeyRegistrationFailed,payload:["reason":.string(Self.safeMessage(error))]),mode:settings.visibilityMode.rawValue)
             throw error
         }
     }
     private func applyFromSettings(_ value:Settings, acknowledged:Bool) async throws {
         try Task.checkCancellation()
+        guard !terminating else { throw CancellationError() }
         guard !blocked else { throw AuditError.latchedFailure }
         guard !launching else { updateStatus("Harness is starting. Please wait before saving Settings."); return }
+        guard overlayModeTask == nil else { updateStatus("Overlay mode is being switched. Please wait."); return }
         guard !settingsApplying else { updateStatus("Settings are being applied. Please wait."); return }
         guard !accountDisconnecting else { updateStatus("Account disconnection is in progress. Please wait before saving Settings."); return }
         try value.validated()
@@ -249,12 +291,13 @@ import HarnessCore
         settingsApplying = true; settingsRevision &+= 1
         let revision = settingsRevision; let previous = store.settings
         presentationGeneration &+= 1
+        clearQueuedCaptures()
         var transition: ModeTransition?
         defer { settingsApplying = false; restoreReadiness() }
         ready = false
         do {
             if let current = operation {
-                current.cancel(); overlay.dismiss(); await privacy.clear()
+                current.cancel(); discardAnswer(); await privacy.clear()
                 await current.value
                 try Task.checkCancellation()
                 guard revision == settingsRevision else { throw CancellationError() }
@@ -279,8 +322,12 @@ import HarnessCore
             configurationChangedNS = changed
             try await audit.record(.init(.settingsChanged,payload:["status":.string("applied"),"source":.string(value.captureSource.rawValue),"network_enabled":.bool(value.networkSubmissionEnabled),"configuration_changed_ns":.integer(Int(changed))]),mode:value.visibilityMode.rawValue)
             guard revision == settingsRevision else { throw CancellationError() }
-            ready = true; settingsUI.load(value); updateStatus("Settings applied. Capture requires your physical \(value.captureHotkey.label) press.")
+            let positioned = repositionSavedAnswer(settings:value)
+            ready = true; settingsUI.load(value)
+            updateStatus(positioned ? "Settings applied. Capture requires your physical \(value.captureHotkey.label) press." :
+                "Settings applied. Display layout changed; clear the saved answer before a new request.")
         } catch {
+            if terminating { hotkeys.shutdown(); await privacy.terminate(); throw CancellationError() }
             if let transition { do { try modes?.rollback(transition) } catch { failClosed(error); throw error } }
             if value.visibilityMode != previous.visibilityMode, !(error is AuditError) {
                 do { try await audit.record(.init(.modeChanged,payload:["from":.integer(previous.visibilityMode.rawValue),"to":.integer(value.visibilityMode.rawValue),"status":.string("failed"),"reason":.string("configuration_or_settings_failure")]),mode:previous.visibilityMode.rawValue) } catch { failClosed(error); throw error }
@@ -291,7 +338,7 @@ import HarnessCore
                 var safe = previous
                 if revision != settingsRevision { safe.networkSubmissionEnabled = false }
                 do {
-                    try await registerHotkeys(settings:safe)
+                    try await registerHotkeys(settings:safe,restoring:true)
                     if revision != settingsRevision { safe.networkSubmissionEnabled = false }
                     try store.save(safe)
                     if safe.networkSubmissionEnabled { try await privacy.grantConsent(acknowledged:true) }
@@ -314,65 +361,113 @@ import HarnessCore
     }
     /// This is the sole production capture entry, bound only to registered Carbon key events.
     private func physicalHotkey(_ action:HotkeyAction) {
-        guard !blocked else { return }
+        guard !terminating, !blocked else { return }
         if case .dismiss = action { dismiss(reason:"hotkey"); return }
         guard ready else { return }
         switch action {
-        case .capture:
+        case .capture, .queueCapture:
+            guard !overlay.hasAnswer else { updateStatus("Press \(store.settings.dismissHotkey.label) to clear the saved answer before a new request."); return }
+            if screenshotBatch.expireIfNeeded() {
+                clearQueuedCaptures(); updateStatus("Queued screenshots expired. Capture them again before sending."); return
+            }
+            if action == .queueCapture && screenshotBatch.count >= ScreenshotBatch.limit {
+                updateStatus("Six screenshots queued. Press \(store.settings.captureHotkey.label) to send or \(store.settings.dismissHotkey.label) to discard."); return
+            }
             guard authentication == nil else { updateStatus("Finish ChatGPT sign-in, then press \(store.settings.captureHotkey.label). No restart is needed."); return }
             guard !store.settings.networkSubmissionEnabled || account.isConnected else { updateStatus("Continue with ChatGPT to get started."); return }
-            guard gate.acquire() else { Task { do { try await audit.record(.init(.captureFailed,payload:["reason":.string("operation_busy")]),mode:store.settings.visibilityMode.rawValue) } catch { failClosed(error) } }; return }
+            guard gate.acquire() else {
+                updateStatus("A capture or request is still in progress. Wait for it to finish, then press \(action == .queueCapture ? store.settings.queueCaptureHotkey.label : store.settings.captureHotkey.label) again.")
+                Task { do { try await audit.record(.init(.captureFailed,payload:["reason":.string("operation_busy")]),mode:store.settings.visibilityMode.rawValue) } catch { failClosed(error) } }
+                return
+            }
             presentationGeneration &+= 1
             let settings = store.settings
             let cursor = NSEvent.mouseLocation
             operation = Task { [weak self] in
                 guard let self else { return }
                 defer { self.gate.release(); self.operation = nil }
-                await self.captureFromHotkey(settings:settings,cursor:cursor)
+                await self.captureFromHotkey(settings:settings,cursor:cursor,queueOnly:action == .queueCapture)
             }
         case .dismiss: dismiss(reason:"hotkey")
         case .scrollUp: overlay.scroll(.up)
         case .scrollDown: overlay.scroll(.down)
+        case .toggleVisibility:
+            guard overlay.hasAnswer else { updateStatus("No saved answer to show or hide."); return }
+            if !overlay.isVisible, let p = answerPresentation,p.displayFrames != displaySnapshot() {
+                updateStatus("Display layout changed; clear the saved answer before a new request.");return
+            }
+            overlay.toggleVisibility()
+            let visible = overlay.isVisible,mode = store.settings.visibilityMode.rawValue
+            updateStatus(visible ? "Saved answer visible." : "Saved answer hidden. Press \(Settings.visibilityHotkey.label) to restore it.")
+            Task {
+                do { try await audit.record(.init(.capabilityCheck,payload:["capability":.string("saved_answer_visibility"),
+                    "status":.string(visible ? "visible":"hidden")]),mode:mode) }
+                catch { failClosed(error) }
+            }
+        case .toggleOverlayMode: switchOverlayFromShortcut()
         }
     }
-    private func captureFromHotkey(settings:Settings,cursor:CGPoint) async {
+    private func captureFromHotkey(settings:Settings,cursor:CGPoint,queueOnly:Bool) async {
         let captureID = UUID(); let started = DispatchTime.now().uptimeNanoseconds
         var captureFinished = false
         do {
-            let displayID = Self.cursorDisplayID()
-            try await audit.record(.init(.captureStarted,payload:["source":.string(settings.captureSource.rawValue),"display_id":.integer(Int(displayID)),"capture_id":.string(captureID.uuidString),"window_id":.integer(overlay.overlayWindowID),"owner_pid":.integer(Int(ProcessInfo.processInfo.processIdentifier)),"monotonic_ns":.integer(Int(started)),"configuration_changed_ns":.integer(Int(configurationChangedNS))]),mode:settings.visibilityMode.rawValue)
-            // Original pixels are scoped to preparation and released before remote streaming.
-            let prepared = try await prepareCapture(settings:settings,captureID:captureID,started:started,cursor:cursor)
-            let image = prepared.image
-            captureFinished = true
-            overlay.dismiss()
+            let prepared:PreparedCapture
+            let images:[QueuedScreenshot]
+            if !queueOnly && screenshotBatch.count > 0 {
+                captureFinished = true
+                guard let last = queuedPresentation else { throw ScreenshotBatchError.invalidImage }
+                prepared = last
+                images = try screenshotBatch.take(settings:settings)
+                clearQueuedCaptures()
+                guard prepared.presentation.displayFrames == displaySnapshot() else { throw CaptureError.displayUnavailable }
+            } else {
+                try await audit.record(.init(.captureStarted,payload:["source":.string(settings.captureSource.rawValue),"display_id":.null,"capture_id":.string(captureID.uuidString),"window_id":.integer(overlay.overlayWindowID),"owner_pid":.integer(Int(ProcessInfo.processInfo.processIdentifier)),"monotonic_ns":.integer(Int(started)),"configuration_changed_ns":.integer(Int(configurationChangedNS))]),mode:settings.visibilityMode.rawValue)
+                prepared = try await prepareCapture(settings:settings,captureID:captureID,started:started,cursor:cursor)
+                captureFinished = true
+                let item = QueuedScreenshot(id:captureID,image:prepared.image)
+                if queueOnly {
+                    try Task.checkCancellation()
+                    try screenshotBatch.append(item,settings:settings)
+                    queuedPresentation = prepared
+                    settingsUI.setQueuedCaptureCount(queuedScreenshotCount)
+                    if queueExpiryTask == nil { scheduleQueueExpiry() }
+                    updateStatus("Queued \(screenshotBatch.count) / 6. Press \(settings.captureHotkey.label) to send together; \(settings.dismissHotkey.label) discards.")
+                    return
+                }
+                images = [item]
+            }
+            discardAnswer()
             try Task.checkCancellation()
             if settings.networkSubmissionEnabled {
                 let token: String
                 do { token = try await account.accessToken() } catch {
-                    try await audit.record(.init(.llmFailed,payload:["reason":.string("account_authentication_unavailable"),"capture_id":.string(captureID.uuidString)]),mode:settings.visibilityMode.rawValue); throw error
+                    try await audit.record(.init(.llmFailed,payload:["reason":.string("account_authentication_unavailable"),"capture_id":.string((images.last?.id ?? captureID).uuidString)]),mode:settings.visibilityMode.rawValue); throw error
                 }
-                let service = RemoteSubmissionService(privacy:privacy,audit:audit)
-                let result = try await service.submit(image:image,settings:settings,
-                    prompt:"Answer the question shown in this capture.",
-                    captureID:captureID,credential:token,source:settings.captureSource,
-                    selectedWindowID:settings.captureSource == .selectedWindow ? settings.selectedWindowID : nil)
+                let service = RemoteSubmissionService(privacy:privacy,audit:audit,providerFactory:providerFactory)
+                let prompt = images.count == 1 ? "Answer the question shown in this capture." :
+                    "These \(images.count) screenshots were captured in order. Treat them together as one question and return one complete answer."
+                let result = try await service.submit(images:images,settings:settings,prompt:prompt,credential:token,
+                    source:settings.captureSource,selectedWindowID:settings.captureSource == .selectedWindow ? settings.selectedWindowID : nil)
                 try Task.checkCancellation()
-                guard prepared.displayFrames == Self.displayFrames() else { throw CaptureError.displayUnavailable }
-                try await showOverlay(settings:settings,text:result.response,
-                                      pane:prepared.pane,cursor:cursor,style:prepared.style)
+                guard prepared.presentation.displayFrames == displaySnapshot() else { throw CaptureError.displayUnavailable }
+                let presentation = prepared.presentation
+                answerPresentation = presentation
+                let current = store.settings
+                try await showOverlay(settings:current,text:result.response,pane:presentation.pane,cursor:presentation.cursor,
+                    style:current.overlayPosition == .pinnedCorner ? presentation.fallbackStyle : presentation.style,
+                    typography:presentation.typography,targetScreen:presentation.targetScreen)
             } else {
                 updateStatus("Capture complete. ChatGPT analysis is disabled in Settings.")
             }
         } catch is CancellationError {
-            overlay.dismiss(); await privacy.clear()
+            discardAnswer(); clearQueuedCaptures(); await privacy.clear()
             if !captureFinished {
                 do { try await audit.record(.init(.captureFailed,payload:["reason":.string("cancelled"),"capture_id":.string(captureID.uuidString)]),mode:settings.visibilityMode.rawValue) }
                 catch { failClosed(error) }
             }
         }
         catch {
-            overlay.dismiss(); await privacy.clear()
+            discardAnswer(); clearQueuedCaptures(); await privacy.clear()
             if error is AuditError { failClosed(error); return }
             if Task.isCancelled {
                 if !captureFinished {
@@ -390,20 +485,28 @@ import HarnessCore
         }
     }
     private struct PreparedCapture {
-        let image: ProcessedImage
+        let image:ProcessedImage
+        let presentation:AnswerPresentation
+    }
+    private struct AnswerPresentation {
         let pane: CGRect?
         let style: OverlayStyle
+        let fallbackStyle:OverlayStyle
         let displayFrames: [UInt32:CGRect]
+        let typography:AdaptiveTypography?
+        let targetScreen:CGRect
+        let cursor:CGPoint
     }
     private func prepareCapture(settings:Settings,captureID:UUID,started:UInt64,cursor:CGPoint) async throws -> PreparedCapture {
         let visible = overlay.isVisible
         let panelRect = overlay.screenRect
         let patchRect = overlay.patchScreenRect
         let generation = presentationGeneration
-        let displaysBefore = Self.displayFrames()
+        let displaysBefore = displaySnapshot()
         let frame = try await capture.capture(settings:settings)
         try Task.checkCancellation()
-        let displaysAfter = Self.displayFrames()
+        let displaysAfter = displaySnapshot()
+        guard displaysBefore == displaysAfter,displaysBefore[frame.displayID] != nil else { throw CaptureError.displayUnavailable }
         let geometry = displaysBefore[frame.displayID].map {
             CalibrationGeometry(displayID:frame.displayID,appKitDisplayFrame:$0,cgDisplayFrame:frame.displayFrame,
                 capturedBounds:frame.capturedBounds,displayScale:frame.displayScale,rotationDegrees:frame.rotation,
@@ -431,14 +534,24 @@ import HarnessCore
         let display = displaysBefore[frame.displayID] ?? .zero
         let cgY = frame.displayFrame.minY + (display.maxY-cursor.y) * frame.displayFrame.height / max(1,display.height)
         let cursorY = (cgY-frame.capturedBounds.minY) / max(1,frame.capturedBounds.height)
+        let visibleFrame = NSScreen.screens.first { $0.frame == display }?.visibleFrame ?? display
+        let fallbackRect = OverlayGeometry.frame(screen:visibleFrame,cursor:cursor,position:.pinnedCorner,
+            contentHeight:42,contentWidth:OverlayGeometry.compactMinimumWidth)
+        let fallbackSample = PaneLocator.captureRect(fallbackRect,capturedBounds:frame.capturedBounds,
+            displayCG:frame.displayFrame,displayAppKit:display)
         let locator = Task.detached(priority:.userInitiated) {
+            // Prepare both modes once so switching a saved answer never
+            // needs another screenshot or any retained native image.
             let pane = PaneLocator.locate(in:frame.image)
-            let style = CapturedAppearance.analyze(image:frame.image,pane:pane ?? CGRect(x:0,y:0,width:1,height:1),
-                                                  cursorY:cursorY)
+            let fallbackStyle = CapturedAppearance.fallback(image:frame.image,logicalBounds:frame.capturedBounds,area:fallbackSample)
+            let style = pane.map { CapturedAppearance.analyze(image:frame.image,pane:$0,cursorY:cursorY) } ?? fallbackStyle
+            let typography = settings.adaptiveTypographyEnabled ? pane.flatMap {
+                TypographyDetector.analyze(image:frame.image,pane:$0,logicalWidth:frame.capturedBounds.width)
+            } : nil
             let image = try ImageProcessor().process(frame.image,settings:settings)
-            return (pane,style,image)
+            return (pane,style,fallbackStyle,image,typography)
         }
-        let (normalizedPane,style,image) = try await withTaskCancellationHandler(operation: { try await locator.value }, onCancel: { locator.cancel() })
+        let (normalizedPane,style,fallbackStyle,image,typography) = try await withTaskCancellationHandler(operation: { try await locator.value }, onCancel: { locator.cancel() })
         try Task.checkCancellation()
         let pane = displaysBefore[frame.displayID].flatMap { display in
             normalizedPane.map {
@@ -447,38 +560,107 @@ import HarnessCore
             }
         }
         try await audit.record(.init(.captureCompleted,payload:["bytes":.integer(image.bytes.count),"width":.integer(image.width),"height":.integer(image.height),"sha256":.string(image.sha256),"overlay_in_capture":calibration.overlayInCapture.map(JSONValue.bool) ?? .null,"calibration_status":.string(calibration.outcome.rawValue),"calibration_reason":.string(calibration.reason.rawValue),"confidence":.number(calibration.confidence),"capture_id":.string(captureID.uuidString),"window_id":.integer(overlay.overlayWindowID),"owner_pid":.integer(Int(ProcessInfo.processInfo.processIdentifier)),"source":.string(settings.captureSource.rawValue),"display_id":.integer(Int(frame.displayID)),"latency_ms":.number(Double(DispatchTime.now().uptimeNanoseconds-started)/1_000_000)]),mode:settings.visibilityMode.rawValue)
-        return PreparedCapture(image:image,pane:pane,style:style,displayFrames:displaysAfter)
+        return PreparedCapture(image:image,presentation:AnswerPresentation(pane:pane,style:style,fallbackStyle:fallbackStyle,displayFrames:displaysAfter,typography:typography,targetScreen:display,cursor:cursor))
     }
     private func showOverlay(settings:Settings,text:String,
-                             pane:CGRect? = nil,cursor:CGPoint? = nil,calibrationMarker:Bool = false,style:OverlayStyle = .fallback) async throws {
+                             pane:CGRect? = nil,cursor:CGPoint? = nil,calibrationMarker:Bool = false,style:OverlayStyle = .fallback,
+                             typography:AdaptiveTypography? = nil,targetScreen:CGRect? = nil) async throws {
         let expectedGeneration = presentationGeneration
         try await audit.record(.init(.capabilityCheck,payload:["capability":.string("overlay_presentation"),"status":.string("prepared")]),mode:settings.visibilityMode.rawValue)
         try Task.checkCancellation()
         guard !blocked, expectedGeneration == presentationGeneration else { throw CancellationError() }
-        let rect = overlay.show(settings:settings,text:text,
-                                pane:pane,cursor:cursor,calibrationMarker:calibrationMarker,style:style)
-        try await audit.record(.init(.overlayShown,payload:["x":.number(rect.minX),"y":.number(rect.minY),"w":.number(rect.width),"h":.number(rect.height),"window_id":.integer(overlay.overlayWindowID),"owner_pid":.integer(Int(ProcessInfo.processInfo.processIdentifier)),"overlay_visibility":.string("not_tested")]),mode:settings.visibilityMode.rawValue)
+        if !calibrationMarker,let p = answerPresentation,p.displayFrames != displaySnapshot() { throw CaptureError.displayUnavailable }
+        // A mode shortcut can run while the preparation audit is suspended.
+        // Read its committed position immediately before drawing the answer.
+        let current = calibrationMarker ? settings : store.settings
+        let currentStyle = calibrationMarker ? style : answerPresentation.map {
+            current.overlayPosition == .pinnedCorner ? $0.fallbackStyle : $0.style
+        } ?? style
+        let rect = overlay.show(settings:current,text:text,
+                                pane:pane,cursor:cursor,calibrationMarker:calibrationMarker,style:currentStyle,typography:typography,targetScreen:targetScreen)
+        try await audit.record(.init(.overlayShown,payload:["x":.number(rect.minX),"y":.number(rect.minY),"w":.number(rect.width),"h":.number(rect.height),"window_id":.integer(overlay.overlayWindowID),"owner_pid":.integer(Int(ProcessInfo.processInfo.processIdentifier)),"overlay_visibility":.string("not_tested")]),mode:current.visibilityMode.rawValue)
     }
     private func showCalibrationFromSettings() async {
         guard ready,operation == nil else { return }
+        guard !overlay.hasAnswer else { updateStatus("Clear the saved answer with \(store.settings.dismissHotkey.label) before showing calibration."); return }
         do { try await showOverlay(settings:store.settings,text:"",calibrationMarker:true) }
         catch is CancellationError {} catch { failClosed(error) }
     }
+    private func clearQueuedCaptures() {
+        queueExpiryTask?.cancel(); queueExpiryTask = nil
+        screenshotBatch.clear(); queuedPresentation = nil
+        settingsUI.setQueuedCaptureCount(0)
+        refreshMenuBar()
+    }
+    private func scheduleQueueExpiry() {
+        let delay = screenshotBatch.remainingLifetimeNS
+        queueExpiryTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds:delay) } catch { return }
+            guard let self,!self.terminating,!self.blocked,self.screenshotBatch.expireIfNeeded() else { return }
+            self.clearQueuedCaptures()
+            self.updateStatus("Queued screenshots expired and were discarded.")
+        }
+    }
+    private func discardAnswer() { overlay.dismiss();answerPresentation = nil }
+    @discardableResult private func repositionSavedAnswer(settings:Settings) -> Bool {
+        guard let p = answerPresentation,overlay.hasAnswer else { return true }
+        guard p.displayFrames == displaySnapshot() else {
+            if overlay.isVisible { overlay.toggleVisibility() }
+            return false
+        }
+        overlay.reposition(settings:settings,pane:p.pane,cursor:p.cursor,
+            style:settings.overlayPosition == .pinnedCorner ? p.fallbackStyle : p.style,
+            typography:p.typography,targetScreen:p.targetScreen)
+        return true
+    }
+    private func switchOverlayFromShortcut() {
+        guard overlayModeTask == nil,authentication == nil,!settingsApplying,!accountDisconnecting else { return }
+        settingsUI.setBusy(true,for:.save)
+        overlayModeTask = Task { [weak self] in
+            guard let self else { return }
+            self.settingsApplying = true;self.ready = false;self.settingsRevision &+= 1
+            let revision = self.settingsRevision,previous = self.store.settings
+            defer {
+                self.settingsApplying = false;self.overlayModeTask = nil
+                self.settingsUI.setBusy(false,for:.save);self.restoreReadiness()
+            }
+            do {
+                try self.checkRunning()
+                var next = previous;next.overlayPosition = previous.overlayPosition == .nearCursor ? .pinnedCorner : .nearCursor
+                try self.store.save(next)
+                try await self.audit.record(.init(.settingsChanged,payload:["status":.string("applied"),
+                    "changed_keys":.array([.string("overlayPosition")]),"source":.string(next.captureSource.rawValue),
+                    "configuration_changed_ns":.integer(Int(self.configurationChangedNS))]),mode:next.visibilityMode.rawValue)
+                try self.checkRunning();guard revision == self.settingsRevision else { throw CancellationError() }
+                self.settingsUI.updateOverlayPosition(next.overlayPosition)
+                let positioned = self.repositionSavedAnswer(settings:next)
+                self.updateStatus(positioned ? "Overlay position: \(next.overlayPosition.displayName)." :
+                    "Display layout changed; clear the saved answer before a new request.")
+            } catch is CancellationError {
+            } catch {
+                if revision == self.settingsRevision {
+                    do { try self.store.save(previous) } catch { self.failClosed(error);return }
+                }
+                if error is AuditError || (error as? SettingsPersistenceError) == .rollbackFailed { self.failClosed(error) }
+                else { self.updateStatus(Self.safeMessage(error)) }
+            }
+        }
+    }
     private func dismiss(reason:String) {
-        presentationGeneration &+= 1; operation?.cancel(); overlay.dismiss()
+        presentationGeneration &+= 1; operation?.cancel(); discardAnswer(); clearQueuedCaptures()
         Task { await privacy.dismiss()
             do { try await audit.record(.init(.overlayDismissed,payload:["reason":.string(reason)]),mode:store.settings.visibilityMode.rawValue) } catch { failClosed(error) }
         }
     }
     private func failClosed(_ error:Error) {
-        blocked = true; ready = false; presentationGeneration &+= 1; operation?.cancel(); hotkeys.shutdown(); overlay.dismiss()
-        Task { await privacy.clear() }
+        blocked = true; ready = false; presentationGeneration &+= 1; operation?.cancel(); overlayModeTask?.cancel(); hotkeys.shutdown(); discardAnswer(); clearQueuedCaptures()
+        Task { await privacy.revokeConsent() }
         updateStatus("Sensitive actions stopped: \(Self.safeMessage(error)) Restart after resolving the error.")
     }
-    private func updateStatus(_ text:String) { settingsUI.setStatus(text); statusItem?.button?.title = "HARNESS · \(store.settings.visibilityMode.rawValue)\(blocked ? " · STOPPED":"")" }
-    private static func cursorDisplayID()->UInt32 {
-        let cursor = NSEvent.mouseLocation
-        return (NSScreen.screens.first(where:{$0.frame.contains(cursor)})?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+    private func updateStatus(_ text:String) { settingsUI.setStatus(text);refreshMenuBar() }
+    private func refreshMenuBar() {
+        let queued = screenshotBatch.count > 0 ? " · \(screenshotBatch.count)/6" : ""
+        statusItem?.button?.title = "HARNESS · \(store.settings.visibilityMode.rawValue)\(queued)\(blocked ? " · STOPPED":"")"
     }
     private static func displayFrames()->[UInt32:CGRect] {
         var result: [UInt32:CGRect] = [:]
@@ -494,16 +676,25 @@ import HarnessCore
         if error is AuditError { return "Mandatory audit could not be recorded." }
         if error is ModeConfigurationError { return "Mode configuration could not be verified; the measurement was aborted." }
         if error is SettingsValidationError || error is SettingsInputError { return "Invalid settings." }
-        if error is HotkeyError { return "Hotkey registration failed; adjust function-key settings or choose other shortcuts." }
+        if error is HotkeyError { return "Hotkey registration failed; choose different Option–Shift number shortcuts." }
         if let value = error as? ChatGPTProviderError { return value.localizedDescription }
         if let value = error as? ChatGPTAuthenticationError { return value.localizedDescription }
         if let value = error as? SettingsPersistenceError { return value.localizedDescription }
         if let value = error as? PrivacyError { return "Privacy validation: \(value)." }
+        if error is SubmissionError { return "ChatGPT returned no complete answer. Try again manually." }
         return "Operation failed (\(String(reflecting:type(of:error))))."
     }
-    @objc private func showSettings() { settingsUI.load(store.settings, preservingDraft:true); settingsUI.setScreenRecordingPermission(granted:screenPermissionGranted()); settingsUI.showWindow(nil); NSApp.activate(ignoringOtherApps:true); settingsUI.window?.makeKeyAndOrderFront(nil) }
+    @objc private func showSettings() { guard !terminating else { return }; settingsUI.load(store.settings, preservingDraft:true); settingsUI.setScreenRecordingPermission(granted:screenPermissionGranted()); settingsUI.showWindow(nil); NSApp.activate(ignoringOtherApps:true); settingsUI.window?.makeKeyAndOrderFront(nil) }
     public func applicationDidBecomeActive(_ notification: Notification) { settingsUI.setScreenRecordingPermission(granted:screenPermissionGranted()) }
     @objc private func quit() { NSApp.terminate(nil) }
     public func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool { showSettings(); return true }
-    public func applicationWillTerminate(_ notification:Notification) { authentication?.cancel(); saveTask?.cancel(); modelTask?.cancel(); windowsTask?.cancel(); permissionTask?.cancel(); calibrationTask?.cancel(); account.cancelSignIn(); operation?.cancel(); hotkeys.shutdown(); overlay.dismiss(); Task { await privacy.terminate() } }
+    public func applicationWillTerminate(_ notification:Notification) {
+        terminating = true; ready = false
+        presentationGeneration &+= 1; authenticationGeneration &+= 1
+        modelGeneration &+= 1; settingsRevision &+= 1
+        launchTask?.cancel(); authentication?.cancel(); saveTask?.cancel(); overlayModeTask?.cancel(); modelTask?.cancel()
+        windowsTask?.cancel(); permissionTask?.cancel(); calibrationTask?.cancel()
+        account.cancelSignIn(); operation?.cancel(); hotkeys.shutdown(); discardAnswer(); clearQueuedCaptures()
+        Task { await privacy.terminate() }
+    }
 }

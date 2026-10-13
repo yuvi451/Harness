@@ -18,12 +18,19 @@ public struct SubmissionResult {
     public func submit(image: ProcessedImage, settings: Settings, prompt: String, captureID: UUID,
                        credential: String?, source: CaptureSource, selectedWindowID: UInt32?,
                        onText: @escaping @MainActor (String, Bool) -> Void = { _,_ in }) async throws -> SubmissionResult {
+        try await submit(images:[QueuedScreenshot(id:captureID,image:image)],settings:settings,prompt:prompt,
+            credential:credential,source:source,selectedWindowID:selectedWindowID,onText:onText)
+    }
+    public func submit(images:[QueuedScreenshot],settings:Settings,prompt:String,credential:String?,
+                       source:CaptureSource,selectedWindowID:UInt32?,
+                       onText:@escaping @MainActor (String,Bool) -> Void = { _,_ in }) async throws -> SubmissionResult {
+        let captureID = images.last?.id ?? UUID()
         var operationID: UUID?
         do {
             guard let credential, !credential.isEmpty else { throw PrivacyError.credentialRequired }
-            let id = try await privacy.beginSubmission(image:image.bytes,settings:settings,credentialPresent:true,
-                source:source,selectedWindowID:selectedWindowID,masksApplied:image.masksApplied,
-                promptChars:prompt.count,audit:audit,captureID:captureID)
+            let id = try await privacy.beginSubmission(images:images.map { $0.image.bytes },settings:settings,credentialPresent:true,
+                source:source,selectedWindowID:selectedWindowID,masksApplied:images.allSatisfy { $0.image.masksApplied },
+                promptChars:prompt.count,audit:audit,captureIDs:images.map(\.id))
             operationID = id
             try Task.checkCancellation()
             let history = await privacy.history.suffix(settings.historyLength).map {
@@ -31,20 +38,25 @@ public struct SubmissionResult {
             }
             try Task.checkCancellation()
             let provider = factory(credential,settings)
-            var text = "", emittedCharacters = 0
-            for try await delta in provider.stream(prompt:prompt,image:image.bytes,history:history) {
+            var text = "", emittedCharacters = 0, emittedBytes = 0
+            for try await delta in provider.stream(prompt:prompt,images:images.map { $0.image.bytes },history:history) {
                 try Task.checkCancellation()
+                let bytes = delta.utf8.count
+                guard bytes <= 400_000 - emittedBytes else { throw PrivacyError.responseTooLarge }
+                emittedBytes += bytes
                 emittedCharacters += delta.count
                 guard emittedCharacters <= 100_000 else { throw PrivacyError.responseTooLarge }
                 text += delta
             }
             try Task.checkCancellation()
-            guard let completion = provider.completionSummary else { throw SubmissionError.incomplete }
+            guard let completion = provider.completionSummary,
+                  !text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else { throw SubmissionError.incomplete }
             try await audit.record(.init(.llmCompleted,payload:["stop_reason":.string(completion.stopReason),
                 "out_chars":.integer(text.count),"latency_ms":.number(completion.latencyMS),"capture_id":.string(captureID.uuidString)]),
                 mode:settings.visibilityMode.rawValue,experimentID:nil)
             try Task.checkCancellation()
             try await privacy.completeSubmission(id:id,response:text)
+            try Task.checkCancellation()
             onText(text,false)
             return SubmissionResult(response:text,completion:completion)
         } catch {

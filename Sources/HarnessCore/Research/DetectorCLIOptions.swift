@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public enum DetectorCommand: String, Sendable { case scan, matrix, correlate, help }
 public enum DetectorCLIError: Error, LocalizedError {
@@ -62,6 +63,34 @@ public struct DetectorCLIOptions: Sendable {
             }
             index += 2
         }
+        if command == .correlate || command == .matrix {
+            let report = result.outputDirectory.appendingPathComponent("report.md")
+            guard !sameFile(result.auditURL, report), !sameFile(result.detectionsURL, report) else {
+                throw DetectorCLIError.invalidArguments
+            }
+        }
         return result
+    }
+
+    private static func sameFile(_ left: URL, _ right: URL) -> Bool {
+        let left = canonicalPath(left)
+        let right = canonicalPath(right)
+        if left == right { return true }
+        var leftInfo = stat(), rightInfo = stat()
+        guard stat(left.path, &leftInfo) == 0, stat(right.path, &rightInfo) == 0 else { return false }
+        return leftInfo.st_dev == rightInfo.st_dev && leftInfo.st_ino == rightInfo.st_ino
+    }
+
+    private static func canonicalPath(_ url: URL) -> URL {
+        // Foundation leaves unresolved ancestors when the final file does not exist yet.
+        var existing = url.standardizedFileURL
+        var suffix: [String] = []
+        while existing.path != "/", !FileManager.default.fileExists(atPath: existing.path) {
+            suffix.append(existing.lastPathComponent)
+            existing.deleteLastPathComponent()
+        }
+        var resolved = existing.resolvingSymlinksInPath().standardizedFileURL
+        for component in suffix.reversed() { resolved.appendPathComponent(component) }
+        return resolved
     }
 }

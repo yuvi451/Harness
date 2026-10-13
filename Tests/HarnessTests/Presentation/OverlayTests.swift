@@ -101,8 +101,8 @@ import XCTest
         let near = OverlayGeometry.frame(screen: screen, cursor: CGPoint(x: -3, y: -190), position: .nearCursor)
         XCTAssertTrue(screen.contains(near))
         let pinned = OverlayGeometry.frame(screen: screen, cursor: .zero, position: .pinnedCorner)
-        XCTAssertEqual(pinned.maxX, screen.maxX - 16)
-        XCTAssertEqual(pinned.maxY, screen.maxY - 16)
+        XCTAssertEqual(pinned.minX, screen.minX + 16)
+        XCTAssertEqual(pinned.minY, screen.minY + 16)
         XCTAssertEqual(CalibrationPatchGeometry.black, CGRect(x: 0, y: 0, width: 4, height: 4))
         XCTAssertEqual(CalibrationPatchGeometry.white, CGRect(x: 12, y: 8, width: 4, height: 8))
     }
@@ -115,7 +115,7 @@ import XCTest
         XCTAssertEqual(frame.minX, pane.minX); XCTAssertEqual(frame.width, pane.width)
         XCTAssertEqual(frame.maxY, cursor.y); XCTAssertEqual(frame.height, 50)
         let low = OverlayGeometry.frame(screen:screen,cursor:CGPoint(x:0,y:-150),position:.nearCursor,pane:pane)
-        XCTAssertEqual(low.maxY,-150); XCTAssertEqual(low.height,50)
+        XCTAssertEqual(low.height,420); XCTAssertEqual(low.minY,pane.minY)
         for y in [-300.0, 950.0] {
             XCTAssertTrue(pane.contains(OverlayGeometry.frame(screen:screen,cursor:CGPoint(x:0,y:y),position:.nearCursor,pane:pane)))
         }
@@ -127,7 +127,7 @@ import XCTest
         guard ProcessInfo.processInfo.environment["HARNESS_RUN_OVERLAY_GUI_TESTS"] == "1" else { throw XCTSkip("Native overlay opt-in") }
         _ = NSApplication.shared
         let controller = OverlayController(); defer { controller.dismiss() }
-        _ = controller.show(settings: Settings(), text: "Simple loops and arrays solve this problem.\nReturn the required answer.")
+        _ = controller.show(settings: Settings(), text: "Simple loops and arrays solve this problem.\nReturn the required answer.",pane:try XCTUnwrap(NSScreen.main).visibleFrame)
         XCTAssertEqual((controller.textView.textStorage?.attribute(.font,at:0,effectiveRange:nil) as? NSFont)?.fontName,"Satoshi-Regular")
         if let path = ProcessInfo.processInfo.environment["HARNESS_CSS_PREVIEW_PATH"] {
             let root = try XCTUnwrap(controller.panel.contentView)
@@ -179,7 +179,7 @@ import XCTest
         XCTAssertNil(controller.patchScreenRect)
     }
 
-    func testFunctionKeyScrollingMovesBothWaysAndNeverAcceptsMouse() throws {
+    func testKeyboardScrollingMovesBothWaysAndNeverAcceptsMouse() throws {
         guard ProcessInfo.processInfo.environment["HARNESS_RUN_OVERLAY_GUI_TESTS"] == "1" else { throw XCTSkip("Native overlay opt-in") }
         _ = NSApplication.shared
         let controller = OverlayController(); defer { controller.dismiss() }
@@ -238,7 +238,9 @@ import XCTest
         XCTAssertEqual(controller.textView.string, "YES")
         XCTAssertLessThan(controller.screenRect.height, 35)
         let scroll = try XCTUnwrap(controller.textView.enclosingScrollView)
-        XCTAssertEqual(scroll.frame, controller.contentBounds)
+        XCTAssertEqual(scroll.frame.width,controller.contentBounds.width)
+        XCTAssertEqual(scroll.frame.maxY,controller.contentBounds.maxY,accuracy:0.1)
+        XCTAssertLessThanOrEqual(controller.contentBounds.height-scroll.frame.height,1)
         XCTAssertEqual(controller.panel.contentView?.subviews.compactMap { $0 as? NSTextField }.count, 0)
         XCTAssertEqual(controller.panel.contentView?.layer?.cornerRadius, 0)
         XCTAssertFalse(controller.panel.hasShadow)

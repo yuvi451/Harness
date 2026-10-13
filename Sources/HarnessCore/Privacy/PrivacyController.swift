@@ -36,22 +36,25 @@ public actor PrivacyController {
         let source: CaptureSource
         let promptCharacters: Int
         var historyLimit: Int
-        var image: Data?
+        var images: [Data]?
         var auditCompleted = false
     }
 
     private var consentGranted = false
     private var operation: Operation?
     private let maxResponseCharacters: Int
+    private let maxResponseBytes: Int
     public private(set) var history: [PrivacyHistoryEntry] = []
 
     /// Bind this to the visible remote-request indicator. It becomes true only after the audit gate.
     public var remoteRequestActive: Bool { operation?.auditCompleted == true }
-    public var retainedImageByteCount: Int { operation?.image?.count ?? 0 }
+    public var retainedImageByteCount: Int { operation?.images?.reduce(0) { $0 + $1.count } ?? 0 }
     public var hasSessionConsent: Bool { consentGranted }
 
     public init(maxResponseCharacters: Int = 100_000) {
         self.maxResponseCharacters = max(0, maxResponseCharacters)
+        let count = max(0, maxResponseCharacters)
+        maxResponseBytes = count > Int.max / 4 ? Int.max : count * 4
     }
 
     public func grantConsent(acknowledged: Bool) throws {
@@ -95,28 +98,41 @@ public actor PrivacyController {
                                 source: CaptureSource, selectedWindowID: UInt32?, masksApplied: Bool,
                                 promptChars: Int, audit: any AuditLogging,
                                 experimentID: UUID? = nil, captureID: UUID? = nil) async throws -> UUID {
+        try await beginSubmission(images:[image],settings:settings,credentialPresent:credentialPresent,source:source,
+            selectedWindowID:selectedWindowID,masksApplied:masksApplied,promptChars:promptChars,audit:audit,
+            experimentID:experimentID,captureIDs:captureID.map { [$0] })
+    }
+
+    public func beginSubmission(images:[Data],settings:Settings,credentialPresent:Bool,
+                                source:CaptureSource,selectedWindowID:UInt32?,masksApplied:Bool,
+                                promptChars:Int,audit:any AuditLogging,experimentID:UUID? = nil,
+                                captureIDs:[UUID]? = nil) async throws -> UUID {
         try Task.checkCancellation()
         try validate(settings: settings, credentialPresent: credentialPresent, source: source,
                      selectedWindowID: selectedWindowID, masksApplied: masksApplied)
         guard operation == nil else { throw PrivacyError.operationInProgress }
-        guard !image.isEmpty, settings.maxImageBytes > 0, image.count <= settings.maxImageBytes else {
+        guard (1...6).contains(images.count),settings.maxImageBytes > 0,
+              images.allSatisfy({ !$0.isEmpty && $0.count <= settings.maxImageBytes }),
+              captureIDs == nil || (captureIDs!.count == images.count && Set(captureIDs!).count == images.count) else {
             throw PrivacyError.invalidImage
         }
         guard promptChars >= 0 else { throw PrivacyError.invalidPromptLength }
         let id = UUID()
         operation = Operation(id: id, provider: settings.provider.rawValue, model: settings.model,
                               source: source, promptCharacters: promptChars,
-                              historyLimit: settings.historyLength, image: image)
+                              historyLimit: settings.historyLength, images: images)
         // Apply a reduced retention limit immediately, even if the new request later fails.
         trimHistory(to: settings.historyLength)
         do {
             try await withTaskCancellationHandler {
-                try await audit.record(AuditEvent(.llmRequest, payload: [
-                    "provider": .string(settings.provider.rawValue),
-                    "model": .string(settings.model),
-                    "prompt_chars": .integer(promptChars),
-                    "capture_id": .string((captureID ?? id).uuidString)
-                ]), mode: settings.visibilityMode.rawValue, experimentID: experimentID)
+                var payload:[String:JSONValue] = [
+                    "provider":.string(settings.provider.rawValue),"model":.string(settings.model),
+                    "prompt_chars":.integer(promptChars),"capture_id":.string((captureIDs?.last ?? id).uuidString)]
+                if images.count > 1 {
+                    payload["image_count"] = .integer(images.count)
+                    payload["capture_ids"] = .array((captureIDs ?? []).map { .string($0.uuidString) })
+                }
+                try await audit.record(AuditEvent(.llmRequest,payload:payload),mode:settings.visibilityMode.rawValue,experimentID:experimentID)
             } onCancel: {
                 Task { await self.cancelSubmission(id: id) }
             }
@@ -138,7 +154,7 @@ public actor PrivacyController {
         }
         // Clean up before handling even an invalid response.
         cancelSubmission(id: id)
-        guard response.count <= maxResponseCharacters else { throw PrivacyError.responseTooLarge }
+        guard response.utf8.count <= maxResponseBytes, response.count <= maxResponseCharacters else { throw PrivacyError.responseTooLarge }
         if current.historyLimit > 0 {
             history.append(PrivacyHistoryEntry(operationID: id, provider: current.provider,
                 model: current.model, source: current.source,
@@ -153,7 +169,7 @@ public actor PrivacyController {
     /// An old cancellation cannot clear a newer request.
     public func cancelSubmission(id: UUID) {
         guard operation?.id == id else { return }
-        operation?.image = nil
+        operation?.images = nil
         operation = nil
     }
 
@@ -162,7 +178,7 @@ public actor PrivacyController {
     public func terminate() { revokeConsent() }
 
     public func clear() {
-        operation?.image = nil
+        operation?.images = nil
         operation = nil
         history.removeAll(keepingCapacity: false)
     }

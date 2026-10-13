@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import zipfile
-from release_privacy import check
+from release_privacy import check, check_archive, check_git_metadata
 
 root = Path(__file__).resolve().parents[1]
 def git(*args):
@@ -15,6 +15,8 @@ if git('status', '--porcelain', '--untracked-files=normal').strip():
 paths = [root/p.decode() for p in git('ls-files','-z').split(b'\0') if p]
 if not check((p.relative_to(root).as_posix(),p.read_bytes()) for p in paths):
     raise SystemExit('Refusing source release with private content.')
+if not check_git_metadata(root):
+    raise SystemExit('Refusing source release with private repository metadata.')
 dist = root/'dist'
 if dist.is_symlink(): raise SystemExit('Unsafe distribution directory.')
 dist.mkdir(exist_ok=True)
@@ -27,5 +29,7 @@ with tempfile.TemporaryDirectory(prefix='harness-source-', suffix='.noindex', di
             if path.suffix == '.otf': continue
             if path.is_symlink() or not path.is_file(): raise SystemExit('Unexpected source entry.')
             output.write(path, 'Harness-source/'+path.relative_to(root).as_posix())
+    if not check_archive(archive):
+        raise SystemExit('Refusing source release with private archive metadata.')
     destination.write_bytes(archive.read_bytes())
 print('Created '+str(destination))

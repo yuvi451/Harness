@@ -10,10 +10,10 @@ import Foundation
         let store = SettingsStore(preferences: UserDefaultsPreferences(domain: domain))
         if action == "write" {
             var settings = store.settings
-            settings.captureHotkey = Shortcut(functionKey: 11)
-            settings.dismissHotkey = Shortcut(functionKey: 12)
-            settings.scrollUpHotkey = Shortcut(functionKey: 13)
-            settings.scrollDownHotkey = Shortcut(functionKey: 14)
+            settings.captureHotkey = Shortcut(digit: 2)
+            settings.dismissHotkey = Shortcut(digit: 9)
+            settings.scrollUpHotkey = Shortcut(digit: 3)
+            settings.scrollDownHotkey = Shortcut(digit: 4)
             settings.model = "saved-custom-model"
             settings.systemPrompt = "Saved custom instructions\né🙂"
             settings.overlayPosition = .pinnedCorner
@@ -31,8 +31,8 @@ import Foundation
             print("saved")
         } else if action == "read" {
             let settings = store.settings
-            guard settings.captureHotkey.functionKey == 11, settings.dismissHotkey.functionKey == 12,
-                  settings.scrollUpHotkey.functionKey == 13, settings.scrollDownHotkey.functionKey == 14, settings.model == "saved-custom-model",
+            guard settings.captureHotkey.digit == 2, settings.dismissHotkey.digit == 9,
+                  settings.scrollUpHotkey.digit == 3, settings.scrollDownHotkey.digit == 4, settings.model == "saved-custom-model",
                   settings.systemPrompt == "Saved custom instructions\né🙂",
                   settings.overlayPosition == .pinnedCorner, settings.visibilityMode == .spaceBehaviorProbe,
                   settings.captureSource == .selectedWindow, settings.selectedWindowID == 321,

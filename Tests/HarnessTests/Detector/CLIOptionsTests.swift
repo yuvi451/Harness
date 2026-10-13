@@ -32,4 +32,48 @@ final class CLIOptionsTests: XCTestCase {
         XCTAssertEqual(options.maximumSkewMS, 250)
         XCTAssertEqual(try DetectorCLIOptions.parse(["scan", "--owner-pid", "42"]).ownerPID, 42)
     }
+
+    func testMatrixCannotReplaceItsAuditInputWithItsReport() throws {
+        XCTAssertThrowsError(try DetectorCLIOptions.parse(["matrix", "--out-dir", "/private/tmp/research",
+            "--audit", "/private/tmp/research/report.md"]))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let actual = directory.appendingPathComponent("actual")
+        try FileManager.default.createDirectory(at: actual, withIntermediateDirectories: true)
+        let alias = directory.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: actual)
+        XCTAssertThrowsError(try DetectorCLIOptions.parse(["matrix", "--out-dir", alias.appendingPathComponent("future").path,
+            "--audit", actual.appendingPathComponent("future/report.md").path]))
+        let report = actual.appendingPathComponent("report.md")
+        try Data("fixture".utf8).write(to: report)
+        let inputAlias = actual.appendingPathComponent("audit-input.jsonl")
+        try FileManager.default.linkItem(at: report, to: inputAlias)
+        XCTAssertThrowsError(try DetectorCLIOptions.parse(["matrix", "--out-dir", actual.path,
+            "--audit", inputAlias.path]))
+    }
+
+    func testCorrelationCannotReplaceEitherInputWithItsReport() throws {
+        for option in ["--audit", "--detections"] {
+            XCTAssertThrowsError(try DetectorCLIOptions.parse(["correlate", "--out-dir", "/private/tmp/research",
+                option, "/private/tmp/research/report.md"]))
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let actual = directory.appendingPathComponent("actual")
+        try FileManager.default.createDirectory(at: actual, withIntermediateDirectories: true)
+        let alias = directory.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: actual)
+        XCTAssertThrowsError(try DetectorCLIOptions.parse(["correlate", "--out-dir", alias.path,
+            "--audit", actual.appendingPathComponent("report.md").path]))
+        XCTAssertThrowsError(try DetectorCLIOptions.parse(["correlate", "--out-dir", alias.appendingPathComponent("future").path,
+            "--audit", actual.appendingPathComponent("future/report.md").path]))
+        let report = actual.appendingPathComponent("report.md")
+        try Data("fixture".utf8).write(to: report)
+        let inputAlias = actual.appendingPathComponent("audit-input.jsonl")
+        try FileManager.default.linkItem(at: report, to: inputAlias)
+        XCTAssertThrowsError(try DetectorCLIOptions.parse(["correlate", "--out-dir", actual.path,
+            "--audit", inputAlias.path]))
+    }
 }

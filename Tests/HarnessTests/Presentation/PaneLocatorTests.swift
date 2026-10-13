@@ -4,6 +4,13 @@ import XCTest
 @testable import HarnessEmitter
 
 final class PaneLocatorTests: XCTestCase {
+    func testWindowColorEdgesWithoutInternalDividerRemainUncertain() throws {
+        let context = try XCTUnwrap(CGContext(data:nil,width:1600,height:900,bitsPerComponent:8,bytesPerRow:6400,
+            space:CGColorSpace(name:CGColorSpace.sRGB)!,bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(CGColor(gray:0,alpha:1));context.fill(CGRect(x:0,y:0,width:1600,height:900))
+        context.setFillColor(CGColor(gray:1,alpha:1));context.fill(CGRect(x:250,y:50,width:1000,height:800))
+        XCTAssertNil(PaneLocator.locate(in:try XCTUnwrap(context.makeImage())),"A window outline is not evidence of left/right panes")
+    }
     func testFaintPartialRailInsideWindowIsExcludedInBothThemesAndAtRetinaScale() throws {
         for dark in [false,true] {
             for scale in [1,2] {
@@ -214,6 +221,12 @@ final class PaneLocatorTests: XCTestCase {
             displayCG:CGRect(x:-1920,y:0,width:1920,height:1080),
             displayAppKit:CGRect(x:-1920,y:-200,width:1920,height:1080))
         XCTAssertEqual(result,CGRect(x:-1680,y:-20,width:480,height:640))
+        let roundTrip = PaneLocator.captureRect(result,capturedBounds:CGRect(x:-1800,y:100,width:1200,height:800),
+            displayCG:CGRect(x:-1920,y:0,width:1920,height:1080),displayAppKit:CGRect(x:-1920,y:-200,width:1920,height:1080))
+        XCTAssertEqual(roundTrip?.minX ?? 0,pane.minX,accuracy:0.0001)
+        XCTAssertEqual(roundTrip?.minY ?? 0,pane.minY,accuracy:0.0001)
+        XCTAssertEqual(roundTrip?.width ?? 0,pane.width,accuracy:0.0001)
+        XCTAssertEqual(roundTrip?.height ?? 0,pane.height,accuracy:0.0001)
     }
     func testProvidedScreenshotPaneWhenExplicitlyOptedIn() throws {
         guard let path = ProcessInfo.processInfo.environment["HARNESS_PANE_REFERENCE_PATH"] else { throw XCTSkip("Local reference image opt-in") }

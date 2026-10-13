@@ -1,11 +1,11 @@
 import AppKit
 import Carbon
 import HarnessCore
-public enum HotkeyAction: UInt32, Sendable { case capture = 1, dismiss = 2, scrollUp = 3, scrollDown = 4 }
+public enum HotkeyAction: UInt32, Sendable { case capture = 1, dismiss = 2, scrollUp = 3, scrollDown = 4, queueCapture = 5, toggleVisibility = 6, toggleOverlayMode = 7 }
 public enum HotkeyError: Error { case registration(OSStatus), handler(OSStatus), unsupported }
 @MainActor public protocol HotkeyRegistering {
     func install(handler: @escaping (UInt32, Bool)->Void) throws
-    func register(keyCode: UInt32, id: UInt32) throws
+    func register(keyCode: UInt32, modifiers: UInt32, id: UInt32) throws
     func unregisterAll()
 }
 @MainActor public final class HotkeyManager {
@@ -13,22 +13,28 @@ public enum HotkeyError: Error { case registration(OSStatus), handler(OSStatus),
     private var actionHandler: ((HotkeyAction)->Void)?
     private var held: Set<UInt32> = []
     private var active = false
+    private var registrationID = UUID()
+    public static let modifiers = UInt32(optionKey | shiftKey)
     public init(registry: any HotkeyRegistering) { self.registry = registry }
     public convenience init() { self.init(registry: CarbonHotkeyRegistry()) }
     public func configure(settings: Settings, handler: @escaping (HotkeyAction)->Void) throws {
         try settings.validated()
         shutdown()
+        let registrationID = self.registrationID
         do {
-            try registry.install { [weak self] id, pressed in self?.receive(id: id, pressed: pressed) }
-            let keys = [settings.captureHotkey, settings.dismissHotkey, settings.scrollUpHotkey, settings.scrollDownHotkey]
+            try registry.install { [weak self] id, pressed in
+                guard let self, self.registrationID == registrationID else { return }
+                self.receive(id: id, pressed: pressed)
+            }
+            let keys = [settings.captureHotkey, settings.dismissHotkey, settings.scrollUpHotkey, settings.scrollDownHotkey, settings.queueCaptureHotkey, Settings.visibilityHotkey, Settings.overlayModeHotkey]
             for (index, shortcut) in keys.enumerated() {
                 guard let keyCode = Self.keyCode(shortcut) else { throw HotkeyError.unsupported }
-                try registry.register(keyCode: keyCode, id: UInt32(index + 1))
+                try registry.register(keyCode: keyCode, modifiers: Self.modifiers, id: UInt32(index + 1))
             }
             actionHandler = handler; active = true
         } catch { shutdown(); throw error }
     }
-    public func shutdown() { active = false; actionHandler = nil; held.removeAll(); registry.unregisterAll() }
+    public func shutdown() { active = false; registrationID = UUID(); actionHandler = nil; held.removeAll(); registry.unregisterAll() }
     private func receive(id: UInt32, pressed: Bool) {
         guard active, let action = HotkeyAction(rawValue: id) else { return }
         if !pressed { held.remove(id); return }
@@ -36,9 +42,9 @@ public enum HotkeyError: Error { case registration(OSStatus), handler(OSStatus),
         actionHandler?(action)
     }
     public static func keyCode(_ shortcut: Shortcut) -> UInt32? {
-        let keys = [kVK_F1,kVK_F2,kVK_F3,kVK_F4,kVK_F5,kVK_F6,kVK_F7,kVK_F8,kVK_F9,kVK_F10,kVK_F11,kVK_F12,kVK_F13,kVK_F14,kVK_F15,kVK_F16,kVK_F17,kVK_F18,kVK_F19,kVK_F20]
-        guard (1...keys.count).contains(shortcut.functionKey) else { return nil }
-        return UInt32(keys[shortcut.functionKey - 1])
+        let keys = [kVK_ANSI_0,kVK_ANSI_1,kVK_ANSI_2,kVK_ANSI_3,kVK_ANSI_4,kVK_ANSI_5,kVK_ANSI_6,kVK_ANSI_7,kVK_ANSI_8,kVK_ANSI_9]
+        guard (0...9).contains(shortcut.digit) else { return nil }
+        return UInt32(keys[shortcut.digit])
     }
 }
 @MainActor public final class SingleFlightCaptureGate {
@@ -65,9 +71,9 @@ public enum HotkeyError: Error { case registration(OSStatus), handler(OSStatus),
                                         Unmanaged.passUnretained(self).toOpaque(), &eventHandler)
         guard status == noErr else { callback = nil; throw HotkeyError.handler(status) }
     }
-    public func register(keyCode: UInt32, id: UInt32) throws {
+    public func register(keyCode: UInt32, modifiers: UInt32, id: UInt32) throws {
         var ref: EventHotKeyRef?
-        let status = RegisterEventHotKey(keyCode, 0,
+        let status = RegisterEventHotKey(keyCode, modifiers,
             EventHotKeyID(signature: 0x48525632, id: id), GetEventDispatcherTarget(), 0, &ref)
         guard status == noErr, let ref else { throw HotkeyError.registration(status) }
         refs.append(ref)

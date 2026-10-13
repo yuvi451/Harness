@@ -107,7 +107,6 @@ public struct CapturePlan {
     public let excludedBundleIdentifier: String?
     public let pixelWidth: Int
     public let pixelHeight: Int
-    public let cursorInDisplay: CGPoint
 }
 
 @MainActor public protocol ScreenshotBackend {
@@ -174,10 +173,6 @@ public struct CapturePlan {
               (0.5...4).contains(display.scale), [0.0, 90, 180, 270].contains(display.rotation) else {
             throw CaptureError.malformedDisplay
         }
-        let cursorCG = CGPoint(
-            x: display.frame.minX + (mouse.x - display.appKitFrame.minX) * display.frame.width / display.appKitFrame.width,
-            y: display.frame.minY + (display.appKitFrame.maxY - mouse.y) * display.frame.height / display.appKitFrame.height)
-        guard cursorCG.x.isFinite, cursorCG.y.isFinite else { throw CaptureError.malformedDisplay }
         var excludedPID: Int32?
         var excludedBundle: String?
         if settings.captureSource == .excludingSelf {
@@ -196,7 +191,7 @@ public struct CapturePlan {
         }
         let plan = CapturePlan(displayID: display.id, source: settings.captureSource,
             selectedWindowID: selectedWindow?.id, excludedProcessID: excludedPID,
-            excludedBundleIdentifier: excludedBundle, pixelWidth: Int(pixelWidth), pixelHeight: Int(pixelHeight), cursorInDisplay: cursorCG)
+            excludedBundleIdentifier: excludedBundle, pixelWidth: Int(pixelWidth), pixelHeight: Int(pixelHeight))
         let image = try await backend.screenshot(plan: plan)
         try Task.checkCancellation()
         guard image.width == plan.pixelWidth, image.height == plan.pixelHeight else { throw CaptureError.captureFailed }

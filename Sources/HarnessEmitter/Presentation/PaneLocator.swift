@@ -72,6 +72,9 @@ enum PaneLocator {
         for (left,right) in zip(lines, lines.dropFirst()) {
             let span = right.x - left.x
             let top = max(left.top,right.top), bottom = max(left.bottom,right.bottom)
+            // Two ordinary window/background edges do not establish split panes.
+            // At least one boundary needs sustained evidence of an actual divider.
+            guard left.thin + right.thin >= height / 4 else { continue }
             guard span >= max(160, width / 5), span <= width * 9 / 10 || right.x == width,
                   min(left.bottom,right.bottom) - top >= height / 4 else { continue }
             let inset = left.x == 0 ? 0 : 1
@@ -82,6 +85,21 @@ enum PaneLocator {
     }
 
     /// Normalized screenshot coordinates are top-left; AppKit coordinates are bottom-left.
+    static func captureRect(_ rect:CGRect,capturedBounds:CGRect,displayCG:CGRect,displayAppKit:CGRect) -> CGRect? {
+        guard [rect,capturedBounds,displayCG,displayAppKit].allSatisfy({
+            !$0.isNull && !$0.isInfinite && $0.width > 0 && $0.height > 0 &&
+                [$0.minX,$0.minY,$0.maxX,$0.maxY].allSatisfy(\.isFinite)
+        }) else { return nil }
+        let x = displayCG.minX + (rect.minX-displayAppKit.minX)*displayCG.width/displayAppKit.width
+        let y = displayCG.minY + (displayAppKit.maxY-rect.maxY)*displayCG.height/displayAppKit.height
+        let normalized = CGRect(x:(x-capturedBounds.minX)/capturedBounds.width,
+            y:(y-capturedBounds.minY)/capturedBounds.height,
+            width:rect.width*displayCG.width/displayAppKit.width/capturedBounds.width,
+            height:rect.height*displayCG.height/displayAppKit.height/capturedBounds.height)
+        let result = normalized.intersection(CGRect(x:0,y:0,width:1,height:1))
+        return result.isNull || result.width <= 0 || result.height <= 0 ? nil : result
+    }
+
     static func screenRect(_ pane: CGRect, capturedBounds: CGRect, displayCG: CGRect, displayAppKit: CGRect) -> CGRect {
         let sx = displayAppKit.width / displayCG.width, sy = displayAppKit.height / displayCG.height
         let x = capturedBounds.minX + pane.minX * capturedBounds.width

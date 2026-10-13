@@ -4,6 +4,26 @@ import XCTest
 @testable import HarnessEmitter
 
 @MainActor final class SettingsLayoutTests: XCTestCase {
+    func testOnlyTwoOverlayChoicesRemain() throws {
+        let controller = try makeSettingsController();defer { controller.close() }
+        let position = try XCTUnwrap(field(named:"Overlay position",in:controller) as? NSPopUpButton)
+        XCTAssertEqual(position.itemTitles,["Automatic pane / cursor","Bottom left (small)"])
+    }
+    func testAdaptiveTypographyToggleAndQueueShortcutSaveAndLockDuringCommit() throws {
+        let controller = try makeSettingsController();defer { controller.close() }
+        let toggle = try button(named:"Match captured text font, size and weight (experimental)",in:controller)
+        let queue = try XCTUnwrap(field(named:"Queue screenshot",in:controller) as? NSPopUpButton)
+        XCTAssertEqual(toggle.state,.off);XCTAssertEqual(queue.titleOfSelectedItem,"⌥⇧5")
+        toggle.state = .on;queue.selectItem(withTitle:"⌥⇧2")
+        var saved:Settings?
+        controller.onSave = { value,_ in saved = value }
+        try button(named:"Save Settings",in:controller).performClick(nil)
+        XCTAssertEqual(saved?.adaptiveTypographyEnabled,true);XCTAssertEqual(saved?.queueCaptureHotkey.digit,2)
+        controller.setBusy(true,for:.save)
+        XCTAssertFalse(toggle.isEnabled);XCTAssertFalse(queue.isEnabled)
+        controller.setBusy(false,for:.save)
+        XCTAssertTrue(toggle.isEnabled);XCTAssertTrue(queue.isEnabled)
+    }
     func testPromptEditorSupportsMultilineSaveResetDraftAndBusyState() throws {
         let controller = try makeSettingsController(); defer { controller.close() }
         let scroll = try XCTUnwrap(field(named:"System prompt",in:controller) as? NSScrollView)
@@ -79,16 +99,17 @@ import XCTest
         let controller = try makeSettingsController()
         defer { controller.close() }
         var settings = Settings()
-        settings.captureHotkey.functionKey = 5
-        settings.dismissHotkey.functionKey = 4
-        settings.scrollUpHotkey.functionKey = 7
-        settings.scrollDownHotkey.functionKey = 6
+        settings.captureHotkey.digit = 5
+        settings.dismissHotkey.digit = 9
+        settings.scrollUpHotkey.digit = 7
+        settings.scrollDownHotkey.digit = 6
+        settings.queueCaptureHotkey.digit = 3
         controller.load(settings)
         let content = try XCTUnwrap(controller.window?.contentView)
         func labels(_ view: NSView) -> [String] {
             (view as? NSTextField).map { [$0.stringValue] } ?? view.subviews.flatMap(labels)
         }
-        XCTAssertTrue(labels(content).contains { $0.contains("F5 captures once; F4 dismisses; F7 scrolls up; F6 scrolls down") })
+        XCTAssertTrue(labels(content).contains { $0.contains("⌥⇧3 queues a screenshot") && $0.contains("⌥⇧5 sends the queue") && $0.contains("⌥⇧9 clears") && $0.contains("⌥⇧7 / ⌥⇧6 scroll") })
     }
 
     func testGrantedScreenPermissionCannotBeRequestedAgainAndRevocationRestoresAction() throws {
@@ -129,6 +150,52 @@ import XCTest
         controller.onSave = { value, _ in saved = value }
         try button(named: "Save Settings", in: controller).performClick(nil)
         XCTAssertEqual(saved?.selectedWindowID, 22)
+    }
+
+    func testWindowsWithIdenticalTitlesRemainIndividuallySelectable() throws {
+        let controller = try makeSettingsController(); defer { controller.close() }
+        controller.setWindows([.init(id: 11, title: "Untitled", owner: "Editor"),
+                               .init(id: 22, title: "Untitled", owner: "Editor")])
+        let row = try XCTUnwrap(field(named: "Selected window", in: controller) as? NSStackView)
+        let choices = try XCTUnwrap(row.arrangedSubviews.compactMap { $0 as? NSPopUpButton }.first)
+        XCTAssertEqual(choices.itemArray.map(\.tag), [0, 11, 22])
+        var saved: Settings?
+        controller.onSave = { value, _ in saved = value }
+        for id in [11, 22] {
+            choices.selectItem(withTag: id)
+            try button(named: "Save Settings", in: controller).performClick(nil)
+            XCTAssertEqual(saved?.selectedWindowID, UInt32(id))
+        }
+    }
+
+    func testSavedAccountsWithIdenticalLabelsKeepStableSelection() throws {
+        let controller = try makeSettingsController(); defer { controller.close() }
+        controller.setAccountChoices([.init(id: "first", label: "same@example.test"),
+                                      .init(id: "second", label: "same@example.test")], selectedID: "second")
+        let choices = try XCTUnwrap(field(named: "Saved ChatGPT accounts", in: controller) as? NSPopUpButton)
+        XCTAssertEqual(choices.itemArray.compactMap { $0.representedObject as? String }, ["first", "second"])
+        var selected: String?
+        controller.onSelectAccount = { selected = $0 }
+        try button(named: "Use saved account", in: controller).performClick(nil)
+        XCTAssertEqual(selected, "second")
+    }
+
+    func testPendingAccountSelectionLocksIdentityControlsButAllowsDisconnect() throws {
+        let controller = try makeSettingsController(); defer { controller.close() }
+        controller.setAccountChoices([.init(id: "first", label: "First")], selectedID: "first")
+        controller.setModels(["gpt-6.1-sol"])
+        controller.setBusy(true, for: .selectAccount)
+        let choices = try XCTUnwrap(field(named: "Saved ChatGPT accounts", in: controller) as? NSPopUpButton)
+        let models = try XCTUnwrap(field(named: "Available account models", in: controller) as? NSPopUpButton)
+        XCTAssertFalse(choices.isEnabled)
+        XCTAssertFalse(models.isEnabled)
+        XCTAssertFalse(try button(named: "Use saved account", in: controller).isEnabled)
+        XCTAssertFalse(try button(named: "Add account…", in: controller).isEnabled)
+        XCTAssertFalse(try button(named: "Continue with ChatGPT", in: controller).isEnabled)
+        XCTAssertFalse(try button(named: "Disconnect account", in: controller).isHidden)
+        XCTAssertTrue(try button(named: "Disconnect account", in: controller).isEnabled)
+        controller.setBusy(false, for: .selectAccount)
+        XCTAssertTrue(choices.isEnabled)
     }
 
     func testNativeLoadingNoTargetClearsOldSelectionAndUnavailableTargetSurvivesOtherEdits() throws {
@@ -234,7 +301,7 @@ import XCTest
         let window = try XCTUnwrap(controller.window), content = try XCTUnwrap(window.contentView)
         let scroll = try XCTUnwrap(content.subviews.compactMap { $0 as? NSScrollView }.first)
         let form = try XCTUnwrap(scroll.documentView as? NSStackView)
-        controller.setStatus("Ready. Press F8 to analyze your screen.")
+        controller.setStatus("Ready. Press ⌥⇧8 to analyze your screen.")
         controller.setAccountStatus("Connected to ChatGPT", connected:true)
         controller.showWindow(nil); content.layoutSubtreeIfNeeded()
         XCTAssertLessThanOrEqual(form.arrangedSubviews.count,10)

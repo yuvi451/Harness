@@ -262,6 +262,31 @@ final class PrivacyTests: XCTestCase {
         XCTAssertTrue(history.isEmpty)
     }
 
+    func testResponseByteBoundRejectsOneOversizedGraphemeAndReleasesImage() async throws {
+        let controller = PrivacyController(maxResponseCharacters: 5)
+        try await controller.grantConsent(acknowledged: true)
+        let id = try await start(controller)
+        let response = "a" + String(repeating: "\u{301}", count: 100)
+        XCTAssertEqual(response.count, 1)
+        do { try await controller.completeSubmission(id: id, response: response); XCTFail("UTF-8 memory bound") }
+        catch { XCTAssertEqual(error as? PrivacyError, .responseTooLarge) }
+        let retained = await controller.retainedImageByteCount
+        let history = await controller.history
+        XCTAssertEqual(retained, 0)
+        XCTAssertTrue(history.isEmpty)
+    }
+
+    func testResponseByteLimitAcceptsFourByteCharactersAndLargeConfiguredLimits() async throws {
+        for limit in [5, Int.max] {
+            let controller = PrivacyController(maxResponseCharacters: limit)
+            try await controller.grantConsent(acknowledged: true)
+            let id = try await start(controller)
+            try await controller.completeSubmission(id: id, response: String(repeating: "🙂", count: 5))
+            let history = await controller.history
+            XCTAssertEqual(history.count, 1)
+        }
+    }
+
     func testInvalidSettingsAndZeroHistoryCannotRetainExchanges() async throws {
         let controller = PrivacyController()
         try await controller.grantConsent(acknowledged: true)

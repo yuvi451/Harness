@@ -2,6 +2,17 @@
 .swiftpm/
 dist/
 .DS_Store
+._*
+__MACOSX/
+.idea/
+.vscode/
+.vs/
+**/xcuserdata/
+*.xcuserstate
+*.user
+*.suo
+*.pdb
+*.log
 __pycache__/
 .env
 .env.*

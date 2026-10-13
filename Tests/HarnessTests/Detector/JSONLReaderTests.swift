@@ -1,8 +1,61 @@
 import Foundation
 import XCTest
 import LockTestSupport
+@testable import HarnessCore
 @testable import HarnessDetector
 final class JSONLReaderTests: XCTestCase {
+    func testAdditionalAuditRetainsSeparateOperatorFailureInCorrelation() throws {
+        let dir = try directory(); defer { try? FileManager.default.removeItem(at: dir) }
+        let primary = dir.appendingPathComponent("emitter.jsonl")
+        let additional = dir.appendingPathComponent("operator.jsonl")
+        let emitter = DetectorFixture.audit()
+        let operatorFailure = AuditRecord(schemaVersion: 1, ts: emitter[0].ts, event: .experimentFailed,
+            mode: 0, macos: "synthetic", sessionID: UUID(), eventID: UUID(),
+            experimentID: DetectorFixture.experiment, sequence: 1,
+            payload: ["source": .string("sck_full"), "reason": .string("timed_out")])
+        var bytes = Data()
+        for record in emitter { bytes.append(try JSONEncoder().encode(record)); bytes.append(10) }
+        try bytes.write(to: primary)
+        var extra = try JSONEncoder().encode(operatorFailure); extra.append(10); try extra.write(to: additional)
+        let result = JSONLReader.readAudit(url: primary, additionalURL: additional)
+        XCTAssertEqual(result.records.map(\.eventID), emitter.map(\.eventID) + [operatorFailure.eventID])
+        XCTAssertTrue(result.issues.isEmpty)
+        let correlation = GroundTruthCorrelator.correlate(audit: result.records, detections: [])
+        XCTAssertEqual(correlation.attempts.count, 1)
+        XCTAssertEqual(correlation.attempts.first?.reason, "timed_out")
+        XCTAssertEqual(correlation.attempts.first?.source, .full)
+    }
+
+    func testAdditionalAuditRetainsReadIssuesFromBothFiles() throws {
+        let dir = try directory(); defer { try? FileManager.default.removeItem(at: dir) }
+        let primary = dir.appendingPathComponent("emitter.jsonl")
+        let additional = dir.appendingPathComponent("operator.jsonl")
+        let records = DetectorFixture.audit()
+        var bytes = try JSONEncoder().encode(records[0]); bytes.append(10)
+        bytes.append(Data("partial".utf8)); try bytes.write(to: primary)
+        var extra = try JSONEncoder().encode(records[1]); extra.append(10)
+        extra.append(Data("{\"schema_version\":999}\n".utf8)); try extra.write(to: additional)
+        let result = JSONLReader.readAudit(url: primary, additionalURL: additional)
+        XCTAssertEqual(result.records.map(\.eventID), records.map(\.eventID))
+        XCTAssertEqual(result.issues, [.init(code: .malformedTail, line: 2), .init(code: .unsupportedSchema, line: 2)])
+    }
+
+    func testAdditionalAuditSkipsCanonicalAndHardLinkAliasesWithoutDuplicatingRecords() throws {
+        let dir = try directory(); defer { try? FileManager.default.removeItem(at: dir) }
+        let primary = dir.appendingPathComponent("audit.jsonl")
+        let record = DetectorFixture.audit()[0]
+        var bytes = try JSONEncoder().encode(record); bytes.append(10); try bytes.write(to: primary)
+        let hardLink = dir.appendingPathComponent("hard.jsonl")
+        try FileManager.default.linkItem(at: primary, to: hardLink)
+        let symbolic = dir.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: symbolic, withDestinationURL: dir)
+        for additional: URL? in [nil, primary, hardLink, symbolic.appendingPathComponent("audit.jsonl")] {
+            let result = JSONLReader.readAudit(url: primary, additionalURL: additional)
+            XCTAssertEqual(result.records.map(\.eventID), [record.eventID])
+            XCTAssertTrue(result.issues.isEmpty)
+        }
+    }
+
     func testHeldWriterLockTimesOutWithoutReadingUncommittedRecords() throws {
         let dir = try directory(); defer { try? FileManager.default.removeItem(at: dir) }
         let url = dir.appendingPathComponent("audit.jsonl")

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import fcntl
 import os
 from pathlib import Path
 import subprocess
@@ -39,6 +40,22 @@ class SigningTests(unittest.TestCase):
         elif command == 'delete-keychain': Path(args[-1]).unlink(missing_ok=True)
         elif command == 'delete-generic-password': self.password = None
         return subprocess.CompletedProcess(args, status, output, 'DO NOT PRINT SECRETS')
+    def test_concurrent_setup_cannot_create_a_second_identity(self):
+        lock = self.root/'org.harness.research.signing.lock'
+        with lock.open('w') as held:
+            lock.chmod(0o600)
+            fcntl.flock(held,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(signing.SigningError): self.signer.identity()
+        self.assertFalse(any(a[1]=='create-keychain' for a in self.calls))
+
+    def test_timed_out_tool_errors_are_bounded_and_redacted(self):
+        def stalled(args, **options):
+            raise subprocess.TimeoutExpired(args,120,output='synthetic-private-value')
+        signer = signing.Signer(self.root,stalled,self.root)
+        with self.assertRaises(signing.SigningError) as failure:
+            signer.run('/usr/bin/security','unlock-keychain','-p','synthetic-private-value')
+        self.assertNotIn('synthetic-private-value',str(failure.exception))
+
     def test_bootstrap_reuses_same_certificate_and_never_changes_trust(self):
         first = self.signer.identity(); second = self.signer.identity()
         self.assertEqual(first, second)

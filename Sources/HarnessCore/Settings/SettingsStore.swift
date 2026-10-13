@@ -64,10 +64,13 @@ public enum SettingsPersistenceError: Error, Equatable, LocalizedError {
     public func save(_ candidate: Settings) throws {
         let validated = try candidate.validated()
         var values: [String: Any] = [
-            "captureHotkey": validated.captureHotkey.functionKey,
-            "dismissHotkey": validated.dismissHotkey.functionKey,
-            "scrollUpHotkey": validated.scrollUpHotkey.functionKey,
-            "scrollDownHotkey": validated.scrollDownHotkey.functionKey,
+            "shortcutSchemaVersion": validated.shortcutSchemaVersion,
+            "captureHotkey": validated.captureHotkey.digit,
+            "dismissHotkey": validated.dismissHotkey.digit,
+            "scrollUpHotkey": validated.scrollUpHotkey.digit,
+            "scrollDownHotkey": validated.scrollDownHotkey.digit,
+            "queueCaptureHotkey": validated.queueCaptureHotkey.digit,
+            "adaptiveTypographyEnabled": validated.adaptiveTypographyEnabled,
             "provider": validated.provider.rawValue,
             "model": validated.model,
             "overlayPosition": validated.overlayPosition.rawValue,
@@ -135,11 +138,22 @@ public enum SettingsPersistenceError: Error, Equatable, LocalizedError {
     }
 
     private func load() {
-        if let n = read("captureHotkey", parse: { Self.integer($0, range: 1...20) }) { settings.captureHotkey = Shortcut(functionKey: n) }
-        if let n = read("dismissHotkey", parse: { Self.integer($0, range: 1...20) }) { settings.dismissHotkey = Shortcut(functionKey: n) }
-        if let n = read("scrollUpHotkey", parse: { Self.integer($0, range: 1...20) }) { settings.scrollUpHotkey = Shortcut(functionKey: n) }
-        if let n = read("scrollDownHotkey", parse: { Self.integer($0, range: 1...20) }) { settings.scrollDownHotkey = Shortcut(functionKey: n) }
-        sanitizeShortcutCollisions()
+        let version = read("shortcutSchemaVersion",parse:{ Self.integer($0,range:1...1) }) ?? 0
+        let names = ["captureHotkey","scrollUpHotkey","scrollDownHotkey","queueCaptureHotkey"]
+        let numbers = names.map { name in read(name,parse:{ Self.integer($0,range:version == 1 ? 0...9 : 1...20) }) }
+        let repaired = Settings.repairedShortcutDigits(numbers)
+        for (i,n) in numbers.enumerated() {
+            if let n,repaired[i] != n {
+                if version == 1 || (2...8).contains(n) || n == 9 {
+                    loadIssues.append("Invalid or duplicate shortcut preference: \(names[i])")
+                }
+            }
+        }
+        settings.applyShortcutDigits(repaired)
+        if let n = read("dismissHotkey",parse:{ Self.integer($0,range:version == 1 ? 0...9 : 1...20) }),version == 1,n != 9 {
+            loadIssues.append("Invalid preference: dismissHotkey")
+        }
+        if let value = read("adaptiveTypographyEnabled",parse:Self.boolean) { settings.adaptiveTypographyEnabled = value }
         if let value = read("provider", parse: { ($0 as? String).flatMap(Provider.init(rawValue:)) }) { settings.provider = value }
         if let value = read("model", parse: { raw -> String? in
             guard let s = raw as? String, Settings.validModel(s) else { return nil }; return s
@@ -176,22 +190,4 @@ public enum SettingsPersistenceError: Error, Equatable, LocalizedError {
         return result
     }
 
-    private func sanitizeShortcutCollisions() {
-        var values = [settings.captureHotkey, settings.dismissHotkey, settings.scrollUpHotkey, settings.scrollDownHotkey]
-        let defaults = [Shortcut(functionKey: 8), Shortcut(functionKey: 9), Shortcut(functionKey: 10), Shortcut(functionKey: 11)]
-        let names = ["captureHotkey", "dismissHotkey", "scrollUpHotkey", "scrollDownHotkey"]
-        for _ in 0..<4 {
-            let duplicateIndices = values.indices.filter { i in values.indices.contains { $0 != i && values[$0] == values[i] } }
-            guard !duplicateIndices.isEmpty else { break }
-            for i in duplicateIndices {
-                values[i] = defaults[i]
-                let issue = "Duplicate shortcut preference: \(names[i])"
-                if !loadIssues.contains(issue) { loadIssues.append(issue) }
-            }
-        }
-        settings.captureHotkey = values[0]
-        settings.dismissHotkey = values[1]
-        settings.scrollUpHotkey = values[2]
-        settings.scrollDownHotkey = values[3]
-    }
 }

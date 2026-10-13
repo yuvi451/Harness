@@ -7,6 +7,36 @@ final class MatrixTests: XCTestCase {
     private let capture = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
     private let configuration = MatrixConfiguration(mode: .spaceBehaviorProbe, source: .full)
 
+    func testLegacyOverlayPositionChangeDoesNotPoisonLaterConfigurationReads() throws {
+        let coordinator = MatrixSessionCoordinator(emitterSessionID: session, experimentID: experiment)
+        let position = record(.settingsChanged, sequence: 3, mode: 2,
+            payload: ["status": .string("applied"), "changed_keys": .array([.string("overlayPosition")])])
+        let changed = record(.settingsChanged, sequence: 4, mode: 2,
+            payload: ["status": .string("applied"), "source": .string("sck_full"), "configuration_changed_ns": .integer(1_100_000_000)])
+        let records = baseline() + [position, changed]
+        let current = try coordinator.currentConfiguration(records: records)
+        XCTAssertEqual(current.source, .full)
+        XCTAssertEqual(current.changedNS, 1_100_000_000)
+        XCTAssertEqual(current.latestSequence, 4)
+        XCTAssertNoThrow(try coordinator.arm(configuration: configuration, records: records, nowMonotonicNS: 1_400_000_000))
+    }
+
+    func testPartialCaptureConfigurationChangesRemainMalformed() {
+        let coordinator = MatrixSessionCoordinator(emitterSessionID: session, experimentID: experiment)
+        let invalidPayloads: [[String: JSONValue]] = [
+            ["status": .string("applied"), "changed_keys": .array([.string("captureSource")])],
+            ["status": .string("applied"), "changed_keys": .array([.string("overlayPosition"), .string("captureSource")])],
+            ["status": .string("applied"), "changed_keys": .array([.string("overlayPosition")]), "source": .string("sck_full")],
+            ["status": .string("applied"), "changed_keys": .array([.string("overlayPosition")]), "configuration_changed_ns": .integer(1_000_000_000)]
+        ]
+        for payload in invalidPayloads {
+            let partial = record(.settingsChanged, sequence: 3, mode: 2, payload: payload)
+            XCTAssertThrowsError(try coordinator.currentConfiguration(records: baseline() + [partial])) {
+                XCTAssertEqual($0 as? MatrixCoordinationError, .malformedRecord)
+            }
+        }
+    }
+
     func testNineConfigurationsAndUntestedProjectionWithoutCaptureRecords() throws {
         let coordinator = MatrixSessionCoordinator(emitterSessionID: session, experimentID: experiment)
         XCTAssertEqual(MatrixConfiguration.all.count, 9)
@@ -82,6 +112,18 @@ final class MatrixTests: XCTestCase {
         XCTAssertEqual(result.reason, "permission_denied")
         XCTAssertEqual(result.windowID, 42); XCTAssertEqual(result.ownerPID, 123)
         XCTAssertNil(result.overlayInCapture)
+    }
+
+    func testUnknownStartDisplayMayResolveAtCompletionButKnownDisplaysMustMatch() throws {
+        let coordinator = MatrixSessionCoordinator(emitterSessionID: session, experimentID: experiment)
+        let arm = try coordinator.arm(configuration: configuration, records: baseline(), nowMonotonicNS: 1_400_000_000)
+        var unknownPayload = start().payload; unknownPayload["display_id"] = .null
+        let unknown = record(.captureStarted, sequence: 3, mode: 2, payload: unknownPayload)
+        var terminalPayload = completed().payload; terminalPayload["display_id"] = .integer(2)
+        let resolved = record(.captureCompleted, sequence: 4, mode: 2, payload: terminalPayload)
+        XCTAssertNotNil(try coordinator.finish(arm: arm, start: unknown, records: baseline() + [unknown, resolved]))
+        let known = start()
+        XCTAssertThrowsError(try coordinator.finish(arm: arm, start: known, records: baseline() + [known, resolved]))
     }
 
     func testLatePreArmCaptureAndConfigurationChangeCannotBecomeMeasurement() throws {

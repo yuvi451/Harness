@@ -4,6 +4,19 @@ import LockTestSupport
 @testable import HarnessCore
 
 final class AuditTests: XCTestCase {
+    func testCaptureDisplayMetadataAllowsUnknownStartAndValidatesKnownIDs() throws {
+        XCTAssertNoThrow(try AuditEvent(.captureStarted, payload: ["source": .string("sck_full"), "display_id": .null]).validate())
+        XCTAssertNoThrow(try AuditEvent(.captureStarted, payload: ["source": .string("sck_full"), "display_id": .integer(Int(UInt32.max))]).validate())
+        let completion: [String: JSONValue] = ["bytes": .integer(1), "width": .integer(1), "height": .integer(1),
+            "sha256": .string(String(repeating: "a", count: 64)), "overlay_in_capture": .null,
+            "calibration_status": .string("indeterminate"), "calibration_reason": .string("geometry_unavailable")]
+        for value: JSONValue in [.integer(0), .integer(-1), .integer(Int(UInt32.max) + 1), .bool(true), .string("1")] {
+            XCTAssertThrowsError(try AuditEvent(.captureStarted, payload: ["source": .string("sck_full"), "display_id": value]).validate())
+            var payload = completion; payload["display_id"] = value
+            XCTAssertThrowsError(try AuditEvent(.captureCompleted, payload: payload).validate())
+        }
+    }
+
     func testSynchronizationRetriesInterruptionsButHasAFiniteLimit() throws {
         var calls = 0
         try CompleteWriter.synchronize { calls += 1; return calls < 3 ? EINTR : nil }
@@ -36,6 +49,29 @@ final class AuditTests: XCTestCase {
             XCTAssertThrowsError(try POSIXAuditSink(url: url, lockTimeoutSeconds: timeout))
             XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
         }
+    }
+
+    func testExistingFIFORefusedWithoutWaitingForAnotherEndpoint() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fifo = directory.appendingPathComponent("audit.jsonl")
+        XCTAssertEqual(mkfifo(fifo.path, 0o600), 0)
+        let group = DispatchGroup(); group.enter()
+        DispatchQueue.global().async {
+            defer { group.leave() }
+            do { _ = try POSIXAuditSink(url: fifo); XCTFail("FIFO was accepted as an audit file") }
+            catch {}
+        }
+        let initial = group.wait(timeout: .now() + 0.25)
+        if initial == .timedOut {
+            let reader = open(fifo.path, O_RDONLY | O_NONBLOCK)
+            let writer = open(fifo.path, O_WRONLY | O_NONBLOCK)
+            _ = group.wait(timeout: .now() + 2)
+            if writer >= 0 { close(writer) }
+            if reader >= 0 { close(reader) }
+        }
+        XCTAssertEqual(initial, .success, "Audit file validation must not wait on FIFO endpoints")
     }
 
     func testContendedAuditLockTimesOutWithoutAppending() throws {
@@ -137,6 +173,18 @@ final class AuditTests: XCTestCase {
         let link = dir.appendingPathComponent("link")
         try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: url.path)
         XCTAssertThrowsError(try POSIXAuditSink(url: link))
+    }
+
+    func testHardLinkAddedAfterSinkInitializationBlocksFurtherAppend() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("audit.jsonl")
+        let sink = try POSIXAuditSink(url: url)
+        try sink.append(Data("first\n".utf8))
+        let alias = directory.appendingPathComponent("alias.jsonl")
+        XCTAssertEqual(link(url.path, alias.path), 0)
+        XCTAssertThrowsError(try sink.append(Data("second\n".utf8)))
+        XCTAssertEqual(try String(contentsOf: alias, encoding: .utf8), "first\n")
     }
     func testMultipleIndependentWriters() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

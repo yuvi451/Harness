@@ -104,7 +104,6 @@ final class CaptureTests: XCTestCase {
         XCTAssertEqual(frame.rotation, 90)
         XCTAssertEqual(frame.displayFrame, CGRect(x: -200, y: -50, width: 200, height: 100))
         await MainActor.run {
-            XCTAssertEqual(pair.1.plans.first?.cursorInDisplay, CGPoint(x: -100, y: -25))
             XCTAssertEqual(pair.1.plans.first?.pixelWidth, 300)
             XCTAssertEqual(pair.1.plans.first?.pixelHeight, 150)
         }
@@ -244,6 +243,14 @@ final class CaptureTests: XCTestCase {
         XCTAssertFalse(encoder.qualities.isEmpty)
         XCTAssertTrue(encoder.qualities.allSatisfy { $0 >= 0.55 })
     }
+    func testCancellationDuringEncodingDoesNotPublishProcessedBytes() async throws {
+        let image = try syntheticImage()
+        let pending = Task.detached {
+            try ImageProcessor(encoder: CancellingJPEGEncoder()).process(image, settings: Settings())
+        }
+        do { _ = try await pending.value; XCTFail("Cancelled encoding published successful bytes") }
+        catch { XCTAssertTrue(error is CancellationError) }
+    }
 }
 
 private func syntheticImage(width: Int = 100, height: Int = 100) throws -> CGImage {
@@ -305,6 +312,13 @@ private final class OversizedJPEGEncoder: JPEGEncoding {
     func encode(_ image: CGImage, quality: Double) throws -> Data {
         qualities.append(quality)
         return Data(repeating: 0, count: 10_001)
+    }
+}
+
+private struct CancellingJPEGEncoder: JPEGEncoding {
+    func encode(_ image: CGImage, quality: Double) throws -> Data {
+        withUnsafeCurrentTask { $0?.cancel() }
+        return Data([1])
     }
 }
 

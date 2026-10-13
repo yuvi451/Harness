@@ -20,6 +20,16 @@ public struct LLMCompletion: Sendable {
 public protocol LLMProvider: Sendable {
     var completionSummary: LLMCompletion? { get }
     func stream(prompt: String, image: Data, history: [LLMExchange]) -> AsyncThrowingStream<String, Error>
+    func stream(prompt: String, images: [Data], history: [LLMExchange]) -> AsyncThrowingStream<String, Error>
+}
+
+public extension LLMProvider {
+    func stream(prompt:String,images:[Data],history:[LLMExchange]) -> AsyncThrowingStream<String,Error> {
+        guard images.count == 1,let image = images.first else {
+            return AsyncThrowingStream { $0.finish(throwing:ChatGPTProviderError.capabilityUnavailable) }
+        }
+        return stream(prompt:prompt,image:image,history:history)
+    }
 }
 
 /// The task is bound synchronously before URLSession starts, including cancellation before headers.

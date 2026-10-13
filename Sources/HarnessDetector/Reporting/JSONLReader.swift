@@ -14,7 +14,17 @@ public struct JSONLReadResult<Record: Sendable>: Sendable {
     public init(records: [Record], issues: [JSONLReadIssue]) { self.records = records; self.issues = issues }
 }
 public enum JSONLReader {
-    public static func readAudit(url: URL, lockTimeoutSeconds: Double = 5) -> JSONLReadResult<AuditRecord> { read(url: url, lockTimeoutSeconds: lockTimeoutSeconds, decode: AuditRecord.decode) }
+    public static func readAudit(url: URL, additionalURL:URL? = nil, lockTimeoutSeconds: Double = 5) -> JSONLReadResult<AuditRecord> {
+        let primary:JSONLReadResult<AuditRecord> = read(url:url,lockTimeoutSeconds:lockTimeoutSeconds,decode:AuditRecord.decode)
+        guard let additionalURL, !sameFile(url,additionalURL) else { return primary }
+        let extra:JSONLReadResult<AuditRecord> = read(url:additionalURL,lockTimeoutSeconds:lockTimeoutSeconds,decode:AuditRecord.decode)
+        return .init(records:primary.records + extra.records,issues:primary.issues + extra.issues)
+    }
+    private static func sameFile(_ left:URL,_ right:URL) -> Bool {
+        if left.resolvingSymlinksInPath().standardizedFileURL == right.resolvingSymlinksInPath().standardizedFileURL { return true }
+        var a = stat(), b = stat()
+        return stat(left.path,&a) == 0 && stat(right.path,&b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino
+    }
     public static func readDetections(url: URL, lockTimeoutSeconds: Double = 5) -> JSONLReadResult<DetectionRecord> { read(url: url, lockTimeoutSeconds: lockTimeoutSeconds, decode: DetectionRecord.decode) }
     private static func read<T: Sendable>(url: URL, lockTimeoutSeconds: Double, decode: (Data) throws -> T) -> JSONLReadResult<T> {
         let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)

@@ -1,7 +1,14 @@
 import CoreGraphics
 
-/// Samples the pane background from the existing capture; typography stays fixed.
+/// Samples backgrounds from the existing capture; no additional screenshots are taken.
 enum CapturedAppearance {
+    static func fallback(image:CGImage,logicalBounds:CGRect,area:CGRect? = nil) -> OverlayStyle {
+        if let area { return analyze(image:image,pane:area,cursorY:area.midY) }
+        guard logicalBounds.width.isFinite,logicalBounds.height.isFinite,logicalBounds.width > 0,logicalBounds.height > 0 else { return .fallback }
+        let w = min(0.95,OverlayGeometry.compactMinimumWidth/logicalBounds.width),h = min(0.5,42/logicalBounds.height)
+        let pane = CGRect(x:min(0.02,16/logicalBounds.width),y:1-h,width:w,height:h)
+        return analyze(image:image,pane:pane,cursorY:1-h/2)
+    }
     static func analyze(image: CGImage,pane: CGRect,cursorY: CGFloat) -> OverlayStyle {
         guard !Task.isCancelled, cursorY.isFinite, image.width <= 16384, image.height <= 16384,
               image.width <= 64_000_000 / max(1,image.height),

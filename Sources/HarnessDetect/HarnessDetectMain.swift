@@ -13,7 +13,7 @@ import HarnessDetector
     matrix [--out-dir PATH] [--audit PATH] [--emitter-session UUID]
            [--timeout 1..300] [--browser NAME] [--browser-version VERSION]
       Walk all nine configurations. Select Settings yourself, return focus to
-      your authorized test app, and physically press the configured F8 key.
+      your authorized test app, and physically press the configured ⌥⇧8 shortcut.
       The detector only observes audit metadata; it cannot trigger captures.
     correlate [--out-dir PATH] [--audit PATH] [--detections PATH]
               [--max-skew-ms 0..10000]
@@ -61,7 +61,8 @@ import HarnessDetector
         print("CoreGraphics: \(String(describing:scan.cgStatus)); ScreenCaptureKit: \(String(describing:scan.sckStatus)). Metadata does not prove pixel inclusion.")
     }
     private static func report(_ options:DetectorCLIOptions) throws {
-        let audit = JSONLReader.readAudit(url:options.auditURL)
+        let audit = JSONLReader.readAudit(url:options.auditURL,additionalURL:options.command == .matrix ?
+            options.outputDirectory.appendingPathComponent("audit.jsonl") : nil)
         let detections = JSONLReader.readDetections(url:options.detectionsURL)
         let result = GroundTruthCorrelator.correlate(audit:audit.records,detections:detections.records,
             maxSkewMS:options.maximumSkewMS,readIssues:audit.issues + detections.issues)
@@ -90,7 +91,7 @@ import HarnessDetector
                 try await Task.sleep(nanoseconds:200_000_000)
                 let arm = try coordinator.arm(configuration:configuration,records:records,nowMonotonicNS:Int(DispatchTime.now().uptimeNanoseconds))
                 stepID = arm.stepID
-                print("Armed step \(arm.stepID.uuidString). Return focus to your test application and physically press the configured capture key once (F8 by default).")
+                print("Armed step \(arm.stepID.uuidString). Return focus to your test application and physically press the configured capture key once (⌥⇧8 by default).")
                 let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(options.timeoutSeconds) * 1_000_000_000
                 let start = try await waitForStart(coordinator:coordinator,arm:arm,url:options.auditURL,deadline:deadline)
                 guard let captureText = start.payload["capture_id"]?.string, let captureID = UUID(uuidString:captureText),

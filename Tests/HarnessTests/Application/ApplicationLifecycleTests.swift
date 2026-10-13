@@ -33,7 +33,7 @@ private actor LifecycleAudit: AuditLogging {
     var onInstall: (() -> Void)?
     var handler: ((UInt32, Bool) -> Void)?
     func install(handler: @escaping (UInt32, Bool) -> Void) throws { configurations += 1; self.handler = handler; onInstall?() }
-    func register(keyCode: UInt32, id: UInt32) throws {}
+    func register(keyCode: UInt32, modifiers: UInt32, id: UInt32) throws {}
     func unregisterAll() {}
 }
 
@@ -55,6 +55,84 @@ private actor LifecycleAudit: AuditLogging {
 }
 
 @MainActor final class ApplicationLifecycleTests: XCTestCase {
+    func testTerminationDuringLaunchCannotRestoreReadinessOrShowSettings() async throws {
+        guard ProcessInfo.processInfo.environment["HARNESS_RUN_OVERLAY_GUI_TESTS"] == "1" else { throw XCTSkip("Native lifecycle opt-in") }
+        _ = NSApplication.shared
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("HarnessStartup-\(UUID().uuidString).noindex")
+        defer { try? FileManager.default.removeItem(at:directory) }
+        let registry = LifecycleRegistry(), account = LifecycleAccount(); account.isConnected = true
+        let value = try ApplicationController(auditURL:directory.appendingPathComponent("audit.jsonl"),preferences:LifecyclePreferences(),account:account,
+            hotkeys:HotkeyManager(registry:registry),modelsLoader:{ _ in [] },windowsLoader:{ [] },
+            screenPermissionGranted:{ true },requestScreenPermission:{ XCTFail("No permission request"); return false })
+        defer { value.settingsUI.close() }
+        registry.onInstall = { registry.onInstall = nil; value.applicationWillTerminate(Notification(name:NSApplication.willTerminateNotification)) }
+        value.wireSettings(); await value.launch()
+        XCTAssertFalse(value.ready)
+        XCTAssertFalse(value.settingsUI.window?.isVisible ?? true)
+    }
+    func testTerminationDuringSettingsApplyCannotReinstallHotkeys() async throws {
+        let registry = LifecycleRegistry()
+        let value = try await controller(preferences:LifecyclePreferences(),registry:registry)
+        defer { value.settingsUI.close() }
+        registry.onInstall = { registry.onInstall = nil; value.applicationWillTerminate(Notification(name:NSApplication.willTerminateNotification)) }
+        var candidate = Settings(); candidate.model = "cancelled-by-termination"
+        value.settingsUI.onSave?(candidate,true)
+        try await settle { registry.configurations >= 2 }
+        try await Task.sleep(nanoseconds:50_000_000)
+        XCTAssertEqual(registry.configurations,2,"Settings recovery must not reinstall registrations after termination")
+        XCTAssertFalse(value.ready)
+    }
+    func testCaptureStartDoesNotClaimCursorDisplayBeforeSourceIsResolved() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("HarnessDisplay-\(UUID().uuidString).noindex")
+        defer { try? FileManager.default.removeItem(at:directory) }
+        let url = directory.appendingPathComponent("audit.jsonl")
+        let registry = LifecycleRegistry(), engine = FailingSyntheticCapture()
+        let value = try await controller(preferences:LifecyclePreferences(),registry:registry,captureEngine:engine,auditURL:url)
+        defer { value.applicationWillTerminate(Notification(name:NSApplication.willTerminateNotification)); value.settingsUI.close() }
+        registry.handler?(1,true)
+        try await settle { engine.calls == 1 }
+        let records = try Data(contentsOf:url).split(separator:10).map { try AuditRecord.decode(Data($0)) }
+        let start = try XCTUnwrap(records.first { $0.event == .captureStarted })
+        XCTAssertEqual(start.payload["display_id"],.null,"Async source selection can choose a window or a moved cursor on another display")
+    }
+    func testTerminationDisablesReadinessAndRejectsQueuedAccountActions() async throws {
+        let account = LifecycleAccount(); account.isConnected = true
+        let prefs = LifecyclePreferences()
+        let value = try await controller(preferences:prefs,account:account)
+        defer { value.settingsUI.close() }
+        value.applicationWillTerminate(Notification(name:NSApplication.willTerminateNotification))
+        XCTAssertFalse(value.ready)
+        value.settingsUI.onAddAccount?()
+        var candidate = Settings(); candidate.model = "must-not-save-after-termination"
+        value.settingsUI.onSave?(candidate,true)
+        try await Task.sleep(nanoseconds:50_000_000)
+        XCTAssertEqual(account.newAccountCalls,0)
+        XCTAssertNotEqual(prefs.values["model"] as? String,"must-not-save-after-termination")
+        XCTAssertFalse(value.ready)
+    }
+    func testDisconnectClearsCredentialsEvenWhenAuditStorageFails() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("HarnessDisconnect-\(UUID().uuidString).noindex")
+        defer { try? FileManager.default.removeItem(at:directory) }
+        let url = directory.appendingPathComponent("audit.jsonl")
+        let account = LifecycleAccount(); account.isConnected = true
+        let value = try await controller(preferences:LifecyclePreferences(),account:account,auditURL:url)
+        defer { value.applicationWillTerminate(Notification(name:NSApplication.willTerminateNotification)); value.settingsUI.close() }
+        let file = try FileHandle(forWritingTo:url)
+        try file.seekToEnd(); try file.write(contentsOf:Data("incomplete".utf8)); try file.close()
+        value.settingsUI.onChatGPTSignOut?()
+        try await settle { value.blocked }
+        XCTAssertTrue(account.disconnected,"An audit outage must not preserve credentials after Disconnect")
+    }
+    func testDisconnectClearsCredentialsEvenWhenPreferencesCannotBeSaved() async throws {
+        let account = LifecycleAccount(); account.isConnected = true
+        let prefs = LifecyclePreferences()
+        let value = try await controller(preferences:prefs,account:account)
+        defer { value.applicationWillTerminate(Notification(name:NSApplication.willTerminateNotification)); value.settingsUI.close() }
+        prefs.failures = 2
+        value.settingsUI.onChatGPTSignOut?()
+        XCTAssertTrue(value.blocked)
+        XCTAssertTrue(account.disconnected,"Failure to save network settings must not skip local credential revocation")
+    }
     func testAddingAccountClearsPreviousAccountContext() async throws {
         let privacy = PrivacyController()
         let account = LifecycleAccount(); account.isConnected = true
@@ -95,13 +173,14 @@ private actor LifecycleAudit: AuditLogging {
     private func controller(preferences: LifecyclePreferences, account: LifecycleAccount? = nil,
                             registry: LifecycleRegistry? = nil, captureEngine: (any CaptureEngineProtocol)? = nil,
                             privacy: PrivacyController = PrivacyController(),
-                            modelsLoader: (@MainActor (String) async throws -> [String])? = nil) async throws -> ApplicationController {
+                            modelsLoader: (@MainActor (String) async throws -> [String])? = nil,
+                            auditURL: URL? = nil) async throws -> ApplicationController {
         guard ProcessInfo.processInfo.environment["HARNESS_RUN_OVERLAY_GUI_TESTS"] == "1" else {
             throw XCTSkip("Native lifecycle integration requires GUI opt-in")
         }
         _ = NSApplication.shared
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("HarnessLifecycle-\(UUID().uuidString).noindex")
-        let value = try ApplicationController(auditURL: directory.appendingPathComponent("audit.jsonl"), preferences: preferences,
+        let value = try ApplicationController(auditURL: auditURL ?? directory.appendingPathComponent("audit.jsonl"), preferences: preferences,
             account: account ?? { let value = LifecycleAccount(); value.isConnected = true; return value }(), hotkeys: HotkeyManager(registry: registry ?? LifecycleRegistry()), privacy:privacy, captureEngine:captureEngine, modelsLoader: modelsLoader ?? { _ in ["gpt-6.1-sol"] }, windowsLoader: { [] }, screenPermissionGranted: { true }, requestScreenPermission: { XCTFail("No real permission requests in lifecycle fixtures"); return false })
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         value.wireSettings(); await value.launch()

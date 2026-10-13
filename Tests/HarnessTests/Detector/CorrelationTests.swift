@@ -3,6 +3,33 @@ import XCTest
 @testable import HarnessCore
 @testable import HarnessDetector
 final class CorrelationTests: XCTestCase {
+    func testDuplicateUnrelatedWindowRowsCannotReplaceMissingTargetAndProduceNegativeTruthMetric() async {
+        let scan = await DetectorFixture.scan(windows: [DetectorFixture.window(id: 99), DetectorFixture.window(id: 99)],
+            context: DetectorFixture.context(truth: true))
+        let result = GroundTruthCorrelator.correlate(audit: DetectorFixture.audit(), detections: scan.records)
+        XCTAssertEqual(result.metrics[0].sampleCount, 0)
+        XCTAssertTrue(result.issues.contains { $0.code == .incompleteScan })
+    }
+
+    func testKnownCaptureDisplayConflictBlocksMetricsWhileUnknownStartCanResolve() async {
+        let scan = await DetectorFixture.scan(context: DetectorFixture.context(truth: true))
+        let original = DetectorFixture.audit()
+        var terminalPayload = original[1].payload; terminalPayload["display_id"] = .integer(2)
+        let terminal = replacing(original[1], payload: terminalPayload)
+        let conflict = GroundTruthCorrelator.correlate(audit: [original[0], terminal], detections: scan.records)
+        XCTAssertEqual(conflict.metrics[0].sampleCount, 0)
+        XCTAssertTrue(conflict.issues.contains { $0.code == .identityConflict })
+        var unknownPayload = original[0].payload; unknownPayload["display_id"] = .null
+        let resolved = GroundTruthCorrelator.correlate(audit: [replacing(original[0], payload: unknownPayload), terminal], detections: scan.records)
+        XCTAssertEqual(resolved.metrics[0].sampleCount, 1)
+    }
+
+    private func replacing(_ record: AuditRecord, payload: [String: JSONValue]) -> AuditRecord {
+        AuditRecord(schemaVersion: record.schemaVersion, ts: record.ts, event: record.event, mode: record.mode,
+            macos: record.macos, sessionID: record.sessionID, eventID: record.eventID,
+            experimentID: record.experimentID, sequence: record.sequence, payload: payload)
+    }
+
     func testExplicitTruthProducesAllFourConfusionCounts() async {
         let positive = await DetectorFixture.scan(context: DetectorFixture.context(truth: true))
         let negative = await DetectorFixture.scan(windows: [], context: DetectorFixture.context(truth: true))
@@ -53,6 +80,8 @@ final class CorrelationTests: XCTestCase {
         let invalid = GroundTruthCorrelator.correlate(audit: DetectorFixture.audit(), detections: scan.records, readIssues: [issue])
         XCTAssertEqual(invalid.metrics[0].sampleCount, 0)
         XCTAssertTrue(invalid.issues.contains { $0.code == .readIssue })
+        XCTAssertEqual(invalid.samples.first?.status, "indeterminate")
+        XCTAssertEqual(invalid.indeterminateCount, 1)
     }
     func testFailedEnumerationAndWindowIDReuseRemainIndeterminate() async {
         let scan = await DetectorFixture.scan(windows: [], context: DetectorFixture.context(truth: true), cgStatus: .failed)

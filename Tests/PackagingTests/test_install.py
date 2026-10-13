@@ -6,6 +6,7 @@ from unittest.mock import patch
 import subprocess
 import zipfile
 import stat
+import os
 
 spec = importlib.util.spec_from_file_location('installer', Path(__file__).resolve().parents[2]/'scripts/install.py')
 installer = importlib.util.module_from_spec(spec); spec.loader.exec_module(installer)
@@ -30,6 +31,22 @@ class InstallTests(unittest.TestCase):
             entry.external_attr = (stat.S_IFLNK | 0o777) << 16
             output.writestr(entry,'../../outside')
         with self.assertRaises(RuntimeError): installer.validate_archive(archive)
+    def test_make_check_runs_when_script_has_no_executable_bit(self):
+        root = Path(__file__).resolve().parents[2]
+        swift = self.root/'swift'
+        swift.write_text('#!/bin/sh\nexit 0\n'); swift.chmod(0o755)
+        result = subprocess.run(['make','check','SCRATCH='+str(self.root/'build')],cwd=root,
+            env={**os.environ,'PATH':str(self.root)+':'+os.environ['PATH']},capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_archive_rejects_case_and_unicode_aliases_on_macos(self):
+        for names in [['Harness/file', 'Harness/FILE'],
+                      ['Harness/café', 'Harness/cafe\u0301']]:
+            archive = self.root/'aliased.zip'
+            with zipfile.ZipFile(archive,'w') as output:
+                for name in names: output.writestr(name,b'fixture')
+            with self.assertRaises(RuntimeError): installer.validate_archive(archive)
+
     def test_real_codesign_requirement_is_read_from_stdout(self):
         requirement = 'designated => identifier "org.harness.research" and certificate leaf = H"fixture"'
         output = subprocess.CompletedProcess([], 0, requirement+'\n', 'Executable=/fixture/Harness\n')

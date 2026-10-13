@@ -13,7 +13,12 @@ import Foundation
     private var generation: UInt64 = 0
     private var signInTask: Task<Void, Error>?
     private var refreshTask: Task<String, Error>?
-    private var revocationTask: Task<Void, Never>?
+    private struct Revocation {
+        var task:Task<Void,Never>?
+        var pendingToken:String?
+    }
+    private var revocations:[String:Revocation] = [:]
+    private var unconfirmedRevocation = false
     private var storageBlocked = false
     public private(set) var accountStatus = "Signed out"
     public var onStatusChanged: (() -> Void)?
@@ -50,6 +55,7 @@ import Foundation
     public func signIn() async throws { try await signIn(newAccount: false) }
     /// Additional registrations remain separate even when they have the same email.
     public func signIn(newAccount: Bool) async throws {
+        try Task.checkCancellation()
         guard !signingIn, refreshTask == nil else { throw ChatGPTAuthenticationError.requestInProgress }
         signingIn = true
         generation &+= 1
@@ -142,9 +148,8 @@ import Foundation
         guard !storageBlocked else { throw ChatGPTAuthenticationError.storageFailure }
         guard !signingIn else { throw ChatGPTAuthenticationError.requestInProgress }
         if let refreshTask {
-            let token = try await refreshTask.value
-            try Task.checkCancellation()
-            return token
+            guard let client = records.activeClientID else { throw ChatGPTAuthenticationError.notSignedIn }
+            return try await refreshedToken(from:refreshTask,attempt:generation,clientID:client)
         }
         // A different controller may have disconnected or rotated this session.
         try reloadSelectedRecords()
@@ -155,8 +160,34 @@ import Foundation
         let task = Task { @MainActor in try await self.refresh(registration, attempt: attempt) }
         refreshTask = task
         defer { refreshTask = nil }
-        let token = try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
-        try Task.checkCancellation()
+        do {
+            return try await withTaskCancellationHandler(operation: {
+                try await refreshedToken(from:task,attempt:attempt,clientID:registration.clientID)
+            }, onCancel: { task.cancel() })
+        } catch {
+            task.cancel()
+            throw error
+        }
+    }
+
+    private func refreshedToken(from task:Task<String,Error>,attempt:UInt64,clientID:String) async throws -> String {
+        // Each joined caller can stop waiting without cancelling the shared owner.
+        let token:String = try await NativeCallbackGate.query(timeoutSeconds:180,timeoutError:ChatGPTAuthenticationError.timedOut) { completion in
+            Task { @MainActor in
+                do { completion(.success(try await task.value)) }
+                catch { completion(.failure(error)) }
+            }
+        }
+        try ensureCurrent(attempt)
+        let expected = activeRegistration
+        let latest = try readStored()
+        adopt(latest,selectedClientID:clientID)
+        guard records.activeClientID == clientID, let current = activeRegistration,
+              current == expected, let tokens = current.tokens, tokens.accessToken == token,
+              Self.hasPlanPermission(tokens) else {
+            updateStatus();throw ChatGPTAuthenticationError.notSignedIn
+        }
+        try ensureCurrent(attempt)
         return token
     }
 
@@ -174,28 +205,46 @@ import Foundation
         }
         updateStatus()
         guard let registration = old, let refresh = registration.tokens?.refreshToken else { return }
-        setStatus("Signed out; remote revocation pending")
-        let signoutGeneration = generation
-        revocationTask?.cancel()
-        revocationTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            var confirmed = false
-            for attempt in 0..<2 {
-                if Task.isCancelled { break }
-                do {
-                    try await self.verifyDiscovery()
-                    let response = try await self.http.send(OpenAIAuth.request(OpenAIAuth.revoke,
-                        fields: ["token": refresh, "token_type_hint": "refresh_token", "client_id": registration.clientID]))
-                    if response.status == 200 { confirmed = true; break }
-                    if response.status < 500 { break }
-                } catch is CancellationError { break } catch {}
-                if attempt == 0 { try? await Task.sleep(nanoseconds: 1_000_000_000) }
-            }
-            if self.generation == signoutGeneration {
-                self.setStatus(confirmed ? "Signed out" : "Signed out; remote revocation was not confirmed. Disconnect Harness in ChatGPT Settings.")
-            }
-            if self.generation == signoutGeneration { self.revocationTask = nil }
+        queueRevocation(clientID:registration.clientID,token:refresh)
+    }
+
+    private func queueRevocation(clientID:String,token:String) {
+        if revocations[clientID] != nil {
+            if revocations[clientID]?.pendingToken != nil { unconfirmedRevocation = true }
+            revocations[clientID]?.pendingToken = token
+            updateStatus();return
         }
+        guard revocations.count < 8 else { unconfirmedRevocation = true;updateStatus();return }
+        revocations[clientID] = Revocation()
+        revocations[clientID]?.task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var next = token
+            while true {
+                var confirmed = false
+                for attempt in 0..<2 {
+                    if Task.isCancelled { break }
+                    do {
+                        try await self.verifyDiscovery()
+                        let response = try await self.http.send(OpenAIAuth.request(OpenAIAuth.revoke,
+                            fields:["token":next,"token_type_hint":"refresh_token","client_id":clientID]))
+                        if response.status == 200 { confirmed = true;break }
+                        if response.status < 500 { break }
+                    } catch is CancellationError { break } catch {}
+                    if attempt == 0 { try? await Task.sleep(nanoseconds:1_000_000_000) }
+                }
+                if !confirmed { self.unconfirmedRevocation = true }
+                if let pending = self.revocations[clientID]?.pendingToken,!Task.isCancelled {
+                    self.revocations[clientID]?.pendingToken = nil;next = pending
+                } else {
+                    if self.revocations[clientID]?.pendingToken != nil { self.unconfirmedRevocation = true }
+                    self.revocations.removeValue(forKey:clientID)
+                    if !self.signingIn { self.updateStatus() }
+                    return
+                }
+                if !self.signingIn { self.updateStatus() }
+            }
+        }
+        updateStatus()
     }
 
     private func refresh(_ registration: ChatGPTAccountRegistration, attempt: UInt64) async throws -> String {
@@ -210,6 +259,7 @@ import Foundation
         if let saved = latest.accounts.first(where: { $0.clientID == registration.clientID }), let tokens = saved.tokens,
            tokens.refreshToken != previous.refreshToken, tokens.expiresAt.timeIntervalSince(clock.now()) > 60 {
             adopt(latest, selectedClientID: registration.clientID); updateStatus()
+            try ensureCurrent(attempt)
             guard Self.hasPlanPermission(tokens) else { throw ChatGPTAuthenticationError.missingPlanPermission }
             return tokens.accessToken
         }
@@ -247,6 +297,7 @@ import Foundation
             candidate.accounts[index].credentialGeneration = UUID()
         }
         updateStatus()
+        try ensureCurrent(attempt)
         guard Self.hasPlanPermission(tokens) else { throw ChatGPTAuthenticationError.missingPlanPermission }
         return tokens.accessToken
     }
@@ -351,7 +402,12 @@ import Foundation
             setStatus(Self.hasPlanPermission(tokens) ? "Connected to ChatGPT" : "Connected to ChatGPT; plan permission is required. Continue with ChatGPT to grant permission.")
         } else { setStatus("Signed out") }
     }
-    private func setStatus(_ value: String) { accountStatus = value; onStatusChanged?() }
+    private func setStatus(_ value: String) {
+        var status = value
+        if !revocations.isEmpty { status += "; remote revocation pending" }
+        if unconfirmedRevocation { status += "; remote revocation was not confirmed. Disconnect Harness in ChatGPT Settings." }
+        accountStatus = status;onStatusChanged?()
+    }
     private static func validRedirect(_ url: URL) -> Bool {
         url.scheme == "http" && url.host == "127.0.0.1" && url.path == "/auth/callback" && url.port.map { (1...65535).contains($0) } == true && url.user == nil && url.password == nil && url.query == nil && url.fragment == nil
     }

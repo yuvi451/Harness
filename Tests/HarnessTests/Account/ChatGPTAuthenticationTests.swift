@@ -6,6 +6,220 @@ import XCTest
 import HarnessCore
 
 final class ChatGPTAuthenticationTests: XCTestCase {
+    @MainActor func testRefreshWaitersRejectDisconnectAfterTheRefreshTaskReturns() async throws {
+        for externalDisconnect in [false, true] {
+            let fixture = try AuthFixture()
+            let controller = fixture.controller()
+            try await controller.signIn()
+            let disconnecting = externalDisconnect ? fixture.controller() : controller
+            fixture.clock.value = fixture.clock.value.addingTimeInterval(3590)
+            fixture.http.suspendRefresh = true
+            let first = Task { try await controller.accessToken() }
+            try await waitForTest { fixture.http.refreshStarted }
+            var joined = false
+            let second = Task { joined = true; return try await controller.accessToken() }
+            try await waitForTest { joined }
+            var disconnect: Task<Void, Error>?
+            controller.onStatusChanged = {
+                if disconnect == nil, fixture.store.records.accounts.first?.tokens?.accessToken == "access-refreshed" {
+                    disconnect = Task { @MainActor in try disconnecting.signOut() }
+                }
+            }
+            fixture.http.releaseRefresh()
+            for caller in [first, second] {
+                do { _ = try await caller.value; XCTFail("Refresh returned a disconnected credential") }
+                catch { XCTAssertTrue(error is CancellationError || error as? ChatGPTAuthenticationError == .notSignedIn) }
+            }
+            try await XCTUnwrap(disconnect).value
+            controller.onStatusChanged = nil
+            XCTAssertNil(fixture.store.records.accounts.first?.tokens)
+        }
+    }
+
+    @MainActor func testRefreshWaitersRejectAnotherControllerRotationBeforeTheyResume() async throws {
+        let fixture = try AuthFixture()
+        let controller = fixture.controller()
+        try await controller.signIn()
+        fixture.clock.value = fixture.clock.value.addingTimeInterval(3590)
+        fixture.http.suspendRefresh = true
+        let first = Task { try await controller.accessToken() }
+        try await waitForTest { fixture.http.refreshStarted }
+        var joined = false
+        let second = Task { joined = true; return try await controller.accessToken() }
+        try await waitForTest { joined }
+        var rotation: Task<Void, Never>?
+        controller.onStatusChanged = {
+            if rotation == nil, fixture.store.records.accounts.first?.tokens?.accessToken == "access-refreshed" {
+                rotation = Task { @MainActor in
+                    let old = fixture.store.records.accounts[0].tokens!
+                    fixture.store.records.accounts[0].tokens = ChatGPTTokens(accessToken: "access-newer",
+                        refreshToken: "refresh-newer", idToken: old.idToken, scopes: old.scopes, expiresAt: old.expiresAt)
+                    fixture.store.records.accounts[0].credentialGeneration = UUID()
+                }
+            }
+        }
+        fixture.http.releaseRefresh()
+        for caller in [first, second] {
+            do { _ = try await caller.value; XCTFail("Refresh returned a superseded credential") }
+            catch { XCTAssertEqual(error as? ChatGPTAuthenticationError, .notSignedIn) }
+        }
+        try await XCTUnwrap(rotation).value
+        controller.onStatusChanged = nil
+        let current = try await controller.accessToken()
+        XCTAssertEqual(current, "access-newer")
+    }
+
+    @MainActor func testCancelledJoinedRefreshReturnsBeforeTheOwnerFinishes() async throws {
+        let fixture = try AuthFixture()
+        let controller = fixture.controller()
+        try await controller.signIn()
+        fixture.clock.value = fixture.clock.value.addingTimeInterval(3590)
+        fixture.http.suspendRefresh = true
+        let owner = Task { try await controller.accessToken() }
+        try await waitForTest { fixture.http.refreshStarted }
+        var joined = false
+        let cancelled = expectation(description: "Joined caller cancelled before refresh finishes")
+        let waiter = Task {
+            joined = true
+            defer { cancelled.fulfill() }
+            return try await controller.accessToken()
+        }
+        try await waitForTest { joined }
+        waiter.cancel()
+        await fulfillment(of: [cancelled], timeout: 0.5)
+        fixture.http.releaseRefresh()
+        do { _ = try await waiter.value; XCTFail("Cancelled waiter received a credential") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let access = try await owner.value
+        XCTAssertEqual(access, "access-refreshed")
+        XCTAssertEqual(fixture.http.refreshCount, 1)
+    }
+
+    @MainActor func testDisconnectingAnotherAccountDoesNotCancelPendingRevocation() async throws {
+        let fixture = try AuthFixture()
+        let controller = fixture.controller()
+        try await controller.signIn()
+        fixture.browser.clientID = "oaiapp_second"
+        try await controller.signIn(newAccount: true)
+        try controller.selectAccount("oaiapp_fixture")
+        fixture.http.suspendNextRevocation = true
+        try controller.signOut()
+        try await waitForTest { fixture.http.revocationStarted }
+        try controller.selectAccount("oaiapp_second")
+        try controller.signOut()
+        try await waitForTest { fixture.http.revocationCount == 2 }
+        XCTAssertFalse(fixture.http.revocationWasCancelled, "A different account's disconnect must preserve this revocation")
+        fixture.http.releaseRevocation()
+        try await waitForTest { !controller.accountStatus.contains("pending") }
+        XCTAssertFalse(controller.accountStatus.contains("not confirmed"))
+        XCTAssertEqual(fixture.http.revocationBodies.count, 2)
+    }
+
+    @MainActor func testFailedRevocationRemainsVisibleWhenAnotherAccountConnectsOrDisconnects() async throws {
+        let fixture = try AuthFixture()
+        let controller = fixture.controller()
+        try await controller.signIn()
+        fixture.browser.clientID = "oaiapp_second"
+        try await controller.signIn(newAccount: true)
+        try controller.selectAccount("oaiapp_fixture")
+        fixture.http.revocationStatuses["oaiapp_fixture"] = 400
+        try controller.signOut()
+        try await waitForTest { controller.accountStatus.contains("not confirmed") }
+        try controller.selectAccount("oaiapp_second")
+        XCTAssertTrue(controller.isConnected)
+        XCTAssertTrue(controller.accountStatus.contains("Connected"))
+        XCTAssertTrue(controller.accountStatus.contains("not confirmed"))
+        try controller.signOut()
+        try await waitForTest { fixture.http.revocationCount == 2 }
+        XCTAssertTrue(controller.accountStatus.contains("not confirmed"))
+    }
+
+    @MainActor func testSameClientPendingRevocationReplacementRetainsAnUnconfirmedOutcome() async throws {
+        let fixture = try AuthFixture()
+        let controller = fixture.controller()
+        try await controller.signIn()
+        let original = try XCTUnwrap(fixture.store.records.accounts.first?.tokens)
+        fixture.http.suspendNextRevocation = true
+        try controller.signOut()
+        try await waitForTest { fixture.http.revocationStarted }
+        for refresh in ["refresh-middle", "refresh-latest"] {
+            fixture.store.records.accounts[0].tokens = ChatGPTTokens(accessToken: "access-reconnected", refreshToken: refresh,
+                idToken: original.idToken, scopes: original.scopes, expiresAt: original.expiresAt)
+            fixture.store.records.accounts[0].credentialGeneration = UUID()
+            try controller.signOut()
+        }
+        XCTAssertFalse(fixture.http.revocationWasCancelled)
+        fixture.http.releaseRevocation()
+        try await waitForTest { !controller.accountStatus.contains("pending") }
+        XCTAssertTrue(controller.accountStatus.contains("not confirmed"), "Displacing a pending token cannot imply all revocations succeeded")
+        XCTAssertEqual(fixture.http.revocationBodies.count, 2, "Only one replacement token is retained per client")
+        XCTAssertTrue(fixture.http.revocationBodies.contains { $0.contains("token=refresh-latest") })
+        XCTAssertFalse(fixture.http.revocationBodies.contains { $0.contains("token=refresh-middle") })
+    }
+
+    @MainActor func testCancelledSignInCannotAuthorizeSavedAccountStorage() async throws {
+        let fixture = try AuthFixture()
+        fixture.store.failReads = true
+        let controller = fixture.controller()
+        fixture.store.failReads = false
+        let pending = Task { @MainActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await controller.signIn()
+        }
+        do { try await pending.value; XCTFail("Cancelled sign-in succeeded") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(fixture.store.authorizedReads, 0, "A cancelled Settings action cannot open storage authorization")
+        XCTAssertTrue(fixture.http.requests.isEmpty)
+        XCTAssertTrue(fixture.browser.opened.isEmpty)
+    }
+
+    @MainActor func testDisconnectDuringRefreshStatusNotificationRejectsEveryWaitingCaller() async throws {
+        let fixture = try AuthFixture()
+        let controller = fixture.controller()
+        try await controller.signIn()
+        fixture.clock.value = fixture.clock.value.addingTimeInterval(3590)
+        fixture.http.suspendRefresh = true
+        let first = Task { try await controller.accessToken() }
+        try await waitForTest { fixture.http.refreshStarted }
+        let joined = expectation(description: "Second caller joined token refresh")
+        let second = Task {
+            joined.fulfill()
+            return try await controller.accessToken()
+        }
+        await fulfillment(of: [joined], timeout: 1)
+        var disconnected = false
+        controller.onStatusChanged = {
+            if !disconnected, fixture.store.records.accounts.first?.tokens?.accessToken == "access-refreshed" {
+                disconnected = true
+                do { try controller.signOut() } catch { XCTFail("Disconnect failed") }
+            }
+        }
+        fixture.http.releaseRefresh()
+        for caller in [first, second] {
+            do { _ = try await caller.value; XCTFail("A waiting caller received a disconnected credential") }
+            catch { XCTAssertTrue(error is CancellationError || error as? ChatGPTAuthenticationError == .notSignedIn) }
+        }
+        XCTAssertTrue(disconnected)
+        XCTAssertFalse(controller.isConnected)
+        XCTAssertNil(fixture.store.records.accounts.first?.tokens)
+    }
+
+    func testJWTRejectsMalformedJWKOperationsInsteadOfIgnoringThem() throws {
+        let fixture = try RSAJWTFixture()
+        let token = try fixture.token(claims: fixture.claims(nonce: "expected-nonce"))
+        let original = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture.jwks) as? [String: Any])
+        let keys = try XCTUnwrap(original["keys"] as? [[String: Any]])
+        let malformedOperations: [Any] = ["verify", [1], NSNull(), [String]()]
+        for operations in malformedOperations {
+            var key = keys[0]; key["key_ops"] = operations
+            let malformed = try JSONSerialization.data(withJSONObject: ["keys": [key]])
+            XCTAssertThrowsError(try OpenAIIDTokenValidator().validate(token, jwks: malformed,
+                clientID: "oaiapp_fixture", nonce: "expected-nonce", now: Date(timeIntervalSince1970: 1_800_000_000))) {
+                XCTAssertEqual($0 as? ChatGPTAuthenticationError, .invalidIdentity)
+            }
+        }
+    }
+
     @MainActor func testSavedAccountSelectionKeepsRegistrationsAndCredentialsSeparate() async throws {
         let first = try AuthFixture(); let initial = first.controller(); try await initial.signIn()
         let second = try AuthFixture(store:first.store); second.browser.clientID = "oaiapp_second"
@@ -572,6 +786,12 @@ final class ChatGPTAuthenticationTests: XCTestCase {
     var refreshCount = 0
     var refreshError: String?
     var revocationCount = 0
+    var suspendNextRevocation = false
+    var revocationStarted = false
+    var revocationWasCancelled = false
+    var revocationContinuation: CheckedContinuation<Void, Error>?
+    var revocationBodies: [String] = []
+    var revocationStatuses: [String: Int] = [:]
     var suspendExchange = false
     var exchangeStarted = false
     var exchangeWasCancelled = false
@@ -590,7 +810,20 @@ final class ChatGPTAuthenticationTests: XCTestCase {
                 "revocation_endpoint": "https://auth.openai.com/api/accounts/oauth/revoke"]))
         }
         if url.path == "/.well-known/jwks.json" { return OAuthHTTPResponse(status: 200, data: jwt.jwks) }
-        if url.path.hasSuffix("/revoke") { revocationCount += 1; return OAuthHTTPResponse(status: 200, data: Data()) }
+        if url.path.hasSuffix("/revoke") {
+            let body = String(data: request.httpBody ?? Data(), encoding: .utf8)!
+            revocationCount += 1; revocationBodies.append(body)
+            if suspendNextRevocation {
+                suspendNextRevocation = false; revocationStarted = true
+                do {
+                    try await withTaskCancellationHandler(operation: {
+                        try await withCheckedThrowingContinuation { revocationContinuation = $0 }
+                    }, onCancel: { Task { @MainActor in self.releaseRevocation(throwing: CancellationError()) } })
+                } catch { revocationWasCancelled = true; throw error }
+            }
+            let client = URLComponents(string: "https://example.invalid/?" + body)?.queryItems?.first { $0.name == "client_id" }?.value ?? ""
+            return OAuthHTTPResponse(status: revocationStatuses[client] ?? 200, data: Data())
+        }
         let refresh = String(data: request.httpBody ?? Data(), encoding: .utf8)!.contains("grant_type=refresh_token")
         if !refresh && suspendExchange {
             exchangeStarted = true
@@ -620,6 +853,10 @@ final class ChatGPTAuthenticationTests: XCTestCase {
     }
     func releaseExchange() { exchangeContinuation?.resume(); exchangeContinuation = nil }
     func releaseRefresh() { refreshContinuation?.resume(); refreshContinuation = nil }
+    func releaseRevocation(throwing error: Error? = nil) {
+        let continuation = revocationContinuation; revocationContinuation = nil
+        if let error { continuation?.resume(throwing: error) } else { continuation?.resume() }
+    }
 }
 
 private struct RSAJWTFixture {

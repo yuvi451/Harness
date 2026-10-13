@@ -4,6 +4,18 @@ import ImageIO
 @testable import HarnessEmitter
 
 @MainActor final class AppearanceTests: XCTestCase {
+    func testSampledMidtonesChooseTheHigherContrastInk() {
+        let fixtures:[(OverlayStyle,NSColor)] = [
+            (.sampled(red:0,green:170,blue:0),.black),
+            (.sampled(red:0,green:130,blue:255),.black),
+            (.sampled(red:127,green:127,blue:127),.black),
+            (.sampled(red:118,green:118,blue:118),.black),
+            (.sampled(red:117,green:117,blue:117),.white),
+            (.sampled(red:31,green:34,blue:39),.white),
+            (.sampled(red:250,green:240,blue:210),.black)
+        ]
+        for (style,ink) in fixtures { XCTAssertEqual(style.foreground,ink,"Wrong ink for \(style)") }
+    }
     private let pane = CGRect(x:0.125,y:0,width:0.75,height:1)
     private func fixture(background: NSColor,ink: NSColor,font: String,size: CGFloat,scale: CGFloat = 1) -> CGImage {
         let bitmap = NSBitmapImageRep(bitmapDataPlanes:nil,pixelsWide:Int(800*scale),pixelsHigh:Int(500*scale),
@@ -76,6 +88,16 @@ import ImageIO
         let image = try XCTUnwrap(context.makeImage())
         assertBackground(CapturedAppearance.analyze(image:image,pane:pane,cursorY:0.1),navy)
         assertBackground(CapturedAppearance.analyze(image:image,pane:pane,cursorY:0.9),cream)
+        assertBackground(CapturedAppearance.fallback(image:image,logicalBounds:CGRect(x:0,y:0,width:800,height:500)),.magenta)
+    }
+    func testCompactFallbackSamplesTheBottomLeftAnchorInsteadOfNeighboringBackground() throws {
+        let canvas = try XCTUnwrap(CGContext(data:nil,width:800,height:500,bitsPerComponent:8,bytesPerRow:3200,
+            space:CGColorSpace(name:CGColorSpace.sRGB)!,bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue))
+        let anchor = NSColor(srgbRed:0.08,green:0.13,blue:0.25,alpha:1)
+        canvas.setFillColor(NSColor.white.cgColor);canvas.fill(CGRect(x:0,y:0,width:800,height:500))
+        canvas.setFillColor(anchor.cgColor);canvas.fill(CGRect(x:0,y:0,width:120,height:60))
+        let image = try XCTUnwrap(canvas.makeImage())
+        assertBackground(CapturedAppearance.fallback(image:image,logicalBounds:CGRect(x:0,y:0,width:800,height:500)),anchor)
     }
     func testInvalidAndCancelledAnalysisDoesNotReadOutsideTheImage() async {
         let image = fixture(background:.white,ink:.black,font:"ArialMT",size:16)

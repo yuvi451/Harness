@@ -8,6 +8,7 @@ import sys
 import tempfile
 import stat
 import zipfile
+import unicodedata
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT/'dist/Harness.zip'
@@ -26,11 +27,12 @@ def validate_archive(path):
             normalized = PurePosixPath(item.filename)
             parts = normalized.parts
             kind = stat.S_IFMT(item.external_attr >> 16)
+            alias = unicodedata.normalize("NFD", normalized.as_posix()).casefold()
             if (not parts or parts[0] != 'Harness' or '..' in parts or '\\' in item.filename
-                    or item.orig_filename != item.filename or normalized.as_posix() in names
+                    or item.orig_filename != item.filename or alias in names
                     or kind not in (0, stat.S_IFREG, stat.S_IFDIR)):
                 raise RuntimeError('Unsafe archive entry.')
-            names.add(normalized.as_posix())
+            names.add(alias)
         if archive.testzip() is not None: raise RuntimeError('Damaged archive.')
 
 def validate(app):

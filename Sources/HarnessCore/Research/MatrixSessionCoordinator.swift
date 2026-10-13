@@ -98,7 +98,7 @@ public struct MatrixSessionCoordinator: Sendable {
         guard selected.filter({ $0.event == .appLaunch }).count == 1,
               selected.first?.event == .appLaunch else { throw MatrixCoordinationError.conflictingCapture }
         var configuration = try activeConfiguration(launch)
-        for record in selected where record.event == .settingsChanged && record.payload["status"]?.string == "applied" {
+        for record in selected where Self.isCaptureConfigurationChange(record) {
             let next = try activeConfiguration(record)
             guard next.changedNS >= configuration.changedNS else { throw MatrixCoordinationError.malformedRecord }
             configuration = next
@@ -154,8 +154,14 @@ public struct MatrixSessionCoordinator: Sendable {
             throw MatrixCoordinationError.conflictingCapture
         }
         try validateExperiment(terminal, arm: arm)
-        for key in ["window_id", "owner_pid", "source", "display_id"] {
+        for key in ["window_id", "owner_pid", "source"] {
             if let value = terminal.payload[key], value != bound.payload[key] { throw MatrixCoordinationError.conflictingCapture }
+        }
+        // The capture engine may only determine the source display after the start audit.
+        // A null start is unknown; a recorded display still binds the terminal identity.
+        if let startDisplay = bound.payload["display_id"]?.int,
+           let terminalDisplay = terminal.payload["display_id"], terminalDisplay != .integer(startDisplay) {
+            throw MatrixCoordinationError.conflictingCapture
         }
         let completed = terminal.event == .captureCompleted
         if completed {
@@ -231,6 +237,13 @@ public struct MatrixSessionCoordinator: Sendable {
         }
         return (mode, source, changed)
     }
+    private static func isCaptureConfigurationChange(_ record:AuditRecord) -> Bool {
+        guard record.event == .settingsChanged, record.payload["status"]?.string == "applied" else { return false }
+        // Version 0.6.0 logged position-only switches without capture metadata.
+        // Ignore only that exact legacy shape; malformed full saves must fail.
+        return !(record.payload["changed_keys"] == .array([.string("overlayPosition")]) &&
+            record.payload["source"] == nil && record.payload["configuration_changed_ns"] == nil)
+    }
     private func recordsForArm(_ arm: MatrixArm, records: [AuditRecord]) throws -> [AuditRecord] {
         guard arm.experimentID == experimentID,
               emitterSessionID == nil || emitterSessionID == arm.emitterSessionID,
@@ -241,7 +254,7 @@ public struct MatrixSessionCoordinator: Sendable {
         guard current.mode == arm.configuration.mode, current.source == arm.configuration.source,
               current.changedNS == arm.configurationChangedNS else { throw MatrixCoordinationError.configurationChanged }
         if selected.contains(where: { $0.sequence > arm.cutoffSequence &&
-            (($0.event == .settingsChanged && $0.payload["status"]?.string == "applied") ||
+            (Self.isCaptureConfigurationChange($0) ||
              ($0.event == .modeChanged && $0.payload["status"]?.string == "applied")) }) {
             throw MatrixCoordinationError.configurationChanged
         }

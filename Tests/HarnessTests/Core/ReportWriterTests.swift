@@ -4,6 +4,43 @@ import LockTestSupport
 @testable import HarnessCore
 
 final class ReportWriterTests: XCTestCase {
+    func testHardLinkAddedWhileWaitingForReportLockIsRefusedBeforeTruncation() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("report.md")
+        let alias = directory.appendingPathComponent("alias.md")
+        try Data("preserve\n".utf8).write(to: url)
+        let descriptor = open(url.path, O_RDWR)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        guard descriptor >= 0 else { return }
+        defer { close(descriptor) }
+        XCTAssertEqual(flock(descriptor, LOCK_EX), 0)
+        defer { _ = flock(descriptor, LOCK_UN) }
+        let entered = DispatchSemaphore(value: 0)
+        let completed = expectation(description: "Writer rejects newly linked report")
+        DispatchQueue.global().async {
+            defer { completed.fulfill() }
+            entered.signal()
+            do {
+                try ProtectedReportWriter.write("replacement\n", to: url, lockTimeoutSeconds: 2)
+                XCTFail("A newly hard-linked report must be refused")
+            } catch {
+                guard let auditError = error as? AuditError, case .unsafeFile = auditError else {
+                    return XCTFail("Expected post-lock unsafe-file validation")
+                }
+            }
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        // Give the writer time to reach the held lock after its initial inode check.
+        usleep(100_000)
+        XCTAssertEqual(link(url.path, alias.path), 0)
+        XCTAssertEqual(flock(descriptor, LOCK_UN), 0)
+        wait(for: [completed], timeout: 3)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "preserve\n")
+        XCTAssertEqual(try String(contentsOf: alias, encoding: .utf8), "preserve\n")
+    }
+
     func testInvalidReportLockBudgetsAreRejectedBeforeCreatingFiles() {
         for timeout in [Double.nan, Double.infinity, -1, 5.01] {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

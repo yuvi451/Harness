@@ -86,6 +86,7 @@ public final class POSIXAuditSink: AuditSink, @unchecked Sendable {
                                    timeoutSeconds: max(0, lockTimeoutSeconds - elapsed))
         defer { _ = flock(fd, LOCK_UN) }
         var info = stat(); guard fstat(fd, &info) == 0 else { throw AuditError.io(errno) }
+        guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(), info.st_nlink == 1 else { throw AuditError.unsafeFile }
         if info.st_size > 0 {
             var last: UInt8 = 0
             let n = pread(fd, &last, 1, info.st_size - 1)
