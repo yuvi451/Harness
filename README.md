@@ -77,3 +77,4 @@ make source
 `test` keeps GUI/capture fixtures gated. `test-native` creates generated windows and registers native hotkeys. `test-capture` additionally acquires the generated selected window; no test images are sent to a real provider. The explicit `--check-chatgpt` diagnostic is different: it uses a real account and consumes plan allowance, so it requires specific authorization.
 
 The last code audit ran 375 Swift tests with zero failures and three optional image-reference skips, 17 packaging tests, and targeted Address/Thread Sanitizers with no findings. It verified installation, archive identity, preference persistence and Advanced controls. Physical Carbon shortcut dispatch and live-account inference remain unverified; the installed saved account required explicit recovery. No Windows runner was available. Consult the evidence ledger before treating a proposed acceptance step as a passed test.
+# Harness
